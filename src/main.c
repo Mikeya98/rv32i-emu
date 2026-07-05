@@ -7,6 +7,7 @@
  */
 
 #include "emu.h"
+#include "decode.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -22,9 +23,7 @@ int main(int argc, char *argv[])
     emu_init(&emu, MEM_SIZE);
 
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0) {
-        printf("[SELFTEST] decode module self-test:\n");
-        /* TODO: decode self-test */
-        printf("  (decode tests pending)\n");
+        decode_selftest();
     } else if (argc > 1) {
         printf("[LOAD] %s\n", argv[1]);
         if (!emu_load_elf(&emu, argv[1])) {

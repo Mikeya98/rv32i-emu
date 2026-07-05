@@ -80,4 +80,7 @@ bool decode(u32 raw, decoded_inst_t *inst);
 /* 调试: 打印指令的反汇编 */
 void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size);
 
+/* 自测: 覆盖全部 6 种指令格式 */
+void decode_selftest(void);
+
 #endif /* _RVEMU_DECODE_H */

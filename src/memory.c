@@ -4,6 +4,7 @@
  */
 
 #include "memory.h"
+#include "csr.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

@@ -12,6 +12,7 @@
 #include "memory.h"
 #include "regfile.h"
 #include "csr.h"
+#include "decode.h"
 
 #define ELF_ENTRY_MAX   256   /* 入口地址 (运行时设置) */
 

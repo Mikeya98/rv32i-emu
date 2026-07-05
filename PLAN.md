@@ -26,8 +26,13 @@
 ### Phase 1: 骨架 (第 1-2 篇的基础)
 - [x] 项目结构 + Makefile
 - [x] types.h / memory.h/c / regfile.h/c
-- [ ] decode self-test — 手写 10 条指令的机器码，验证解码正确
-- [ ] ELF parser (32-bit RISC-V ELF)
+- [x] ELF parser (32-bit RISC-V ELF) — elf.h/c 完成
+- [x] decode 框架 — 6 种格式完整解析
+- [x] CSR 框架 — 最小 Machine-mode CSR
+- [x] GitHub 仓库建好 + 代码推送: `github.com/Mikeya98/rv32i-emu`
+- [x] 知乎第 1 篇撰写完毕: ELF 解析与内存模型
+- [ ] decode self-test — 手写指令机器码验证
+- [ ] execute.c — 执行引擎
 
 ### Phase 2: 核心执行 (第 3-5 篇)
 - [ ] execute.c — RV32I 40 条指令逐条实现

@@ -11,6 +11,7 @@
 #define _RVEMU_ELF_H
 
 #include "types.h"
+#include "memory.h"
 
 /* =========================== ELF 常量 =========================== */
 #define ELF_MAGIC    0x464C457F  /* "\x7FELF" 小端 */
