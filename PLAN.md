@@ -31,11 +31,11 @@
 - [x] CSR 框架 — 最小 Machine-mode CSR
 - [x] GitHub 仓库建好 + 代码推送: `github.com/Mikeya98/rv32i-emu`
 - [x] 知乎第 1 篇撰写完毕: ELF 解析与内存模型
-- [ ] decode self-test — 手写指令机器码验证
-- [ ] execute.c — 执行引擎
+- [x] decode self-test — 45/45 pass
+- [x] execute.c — 执行引擎 (Phase 2 合并完成)
 
 ### Phase 2: 核心执行 (第 3-5 篇)
-- [ ] execute.c — RV32I 40 条指令逐条实现
+- [x] execute.c — RV32I 40 条指令逐条实现
   - ALU: add/sub/sll/slt/sltu/xor/srl/sra/or/and
   - ALUI: addi/slli/slti/sltiu/xori/srli/srai/ori/andi
   - LOAD: lb/lh/lw/lbu/lhu
@@ -43,7 +43,9 @@
   - BRANCH: beq/bne/blt/bge/bltu/bgeu
   - JAL/JALR/LUI/AUIPC
   - SYSTEM: ecall/ebreak/csr*
-- [ ] 主循环: while(running) { fetch → decode → execute → pc+=4 }
+- [x] 主循环: while(running) { fetch → decode → execute → pc+=4 }
+- [x] execute self-test: 31/31 pass
+- [x] 知乎第 3 篇撰写完毕: 寄存器文件 + addi（待发布）
 
 ### Phase 3: 控制流 + 特权 (第 6 篇)
 - [ ] 分支/跳转实现 (PC 修改)

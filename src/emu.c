@@ -2,11 +2,12 @@
  * @file    emu.c
  * @brief   RV32I Emulator — 顶层模拟器实现
  *
- * TODO: fetch-decode-execute 主循环。
+ * fetch-decode-execute 主循环。
  */
 
 #include "emu.h"
 #include "elf.h"
+#include "execute.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -52,18 +53,46 @@ bool emu_load_elf(emulator_t *emu, const char *path)
 
 u64 emu_run(emulator_t *emu, u64 max_steps)
 {
-    (void)emu;
-    (void)max_steps;
-    /* TODO: main loop */
-    return 0;
+    u64 steps = 0;
+    decoded_inst_t inst;
+
+    while (emu->state == EMU_RUNNING) {
+        if (max_steps > 0 && steps >= max_steps) break;
+        if (!emu_step(emu, &inst)) break;
+        steps++;
+    }
+
+    return steps;
 }
 
 bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 {
-    (void)emu;
-    (void)inst_out;
-    /* TODO: single step */
-    return false;
+    u32 raw;
+    u32 pc = emu->rf.pc;
+
+    /* 1. Fetch: 从内存取出 32-bit 指令 */
+    if (!memory_read32(&emu->mem, pc, &raw)) {
+        printf("[EMU] fetch failed at pc=0x%08X\n", pc);
+        emu->state = EMU_EXCEPTION;
+        return false;
+    }
+
+    /* 2. Decode */
+    if (!decode(raw, inst_out)) {
+        printf("[EMU] decode failed at pc=0x%08X raw=0x%08X\n", pc, raw);
+        emu->state = EMU_EXCEPTION;
+        return false;
+    }
+
+    /* 3. Execute (内部更新 pc 和 state) */
+    if (!execute(emu, inst_out)) {
+        return false;
+    }
+
+    /* 4. 周期计数 */
+    emu->csr.mcycle++;
+
+    return true;
 }
 
 void emu_dump_state(emulator_t *emu)

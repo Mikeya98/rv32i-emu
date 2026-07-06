@@ -8,6 +8,7 @@
 
 #include "emu.h"
 #include "decode.h"
+#include "execute.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -24,6 +25,7 @@ int main(int argc, char *argv[])
 
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0) {
         decode_selftest();
+        execute_selftest();
     } else if (argc > 1) {
         printf("[LOAD] %s\n", argv[1]);
         if (!emu_load_elf(&emu, argv[1])) {
