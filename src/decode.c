@@ -120,29 +120,182 @@ bool decode(u32 raw, decoded_inst_t *inst)
 }
 
 /* =========================== 反汇编 (调试用) =========================== */
-static const char *op_name(opcode_t op)
+
+/* ABI 寄存器名, 反汇编和调试器都用这一份 */
+static const char *const reg_name[32] = {
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+    "s0",   "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+    "a6",   "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+    "s8",   "s9", "s10","s11","t3", "t4", "t5", "t6"
+};
+
+static const char *rn(u32 idx)
 {
-    switch (op) {
-    case OP_LUI:    return "lui";
-    case OP_AUIPC:  return "auipc";
-    case OP_JAL:    return "jal";
-    case OP_JALR:   return "jalr";
-    case OP_BRANCH: return "branch";
-    case OP_LOAD:   return "load";
-    case OP_STORE:  return "store";
-    case OP_ALUI:   return "alu-i";
-    case OP_ALU:    return "alu";
-    case OP_SYSTEM: return "system";
-    default:        return "???";
-    }
+    return (idx < 32) ? reg_name[idx] : "?";
+}
+
+/* R-type ALU 助记符: funct3 + funct7 决定 (含 RV32M) */
+static const char *alu_name(u8 f3, u8 f7)
+{
+    static const char *const base[8] = {
+        "add", "sll", "slt", "sltu", "xor", "srl", "or", "and"
+    };
+    static const char *const alt[8] = {
+        "sub", NULL, NULL, NULL, NULL, "sra", NULL, NULL
+    };
+    static const char *const m[8] = {
+        "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"
+    };
+
+    if (f3 >= 8) return NULL;
+    if (f7 == 0x01) return m[f3];
+    if (f7 == 0x20) return alt[f3];
+    if (f7 == 0x00) return base[f3];
+    return NULL;
+}
+
+static const char *alui_name(u8 f3, u8 f7)
+{
+    static const char *const n[8] = {
+        "addi", "slli", "slti", "sltiu", "xori", "srli", "ori", "andi"
+    };
+    if (f3 >= 8) return NULL;
+    if (f3 == 5 && f7 == 0x20) return "srai";
+    if (f3 == 1 && f7 != 0x00) return NULL;   /* 当前不区分 RV32I 的 shamt 高位 */
+    if (f3 == 5 && f7 != 0x00 && f7 != 0x20) return NULL;
+    return n[f3];
+}
+
+static const char *load_name(u8 f3)
+{
+    static const char *const n[8] = { "lb", "lh", "lw", NULL, "lbu", "lhu", NULL, NULL };
+    return (f3 < 8) ? n[f3] : NULL;
+}
+
+static const char *store_name(u8 f3)
+{
+    static const char *const n[8] = { "sb", "sh", "sw", NULL, NULL, NULL, NULL, NULL };
+    return (f3 < 8) ? n[f3] : NULL;
+}
+
+static const char *branch_name(u8 f3)
+{
+    static const char *const n[8] = {
+        "beq", "bne", NULL, NULL, "blt", "bge", "bltu", "bgeu"
+    };
+    return (f3 < 8) ? n[f3] : NULL;
+}
+
+static const char *csr_name(u8 f3)
+{
+    static const char *const n[8] = {
+        NULL, "csrrw", "csrrs", "csrrc", NULL, "csrrwi", "csrrsi", "csrrci"
+    };
+    return (f3 < 8) ? n[f3] : NULL;
 }
 
 void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
 {
-    snprintf(buf, buf_size,
-             "[0x%08X] %-7s rd=x%u rs1=x%u rs2=x%u imm=%d (0x%X) f3=%u f7=%u",
-             inst->raw, op_name(inst->opcode),
-             inst->rd, inst->rs1, inst->rs2,
-             inst->imm, inst->imm,
-             inst->funct3, inst->funct7);
+    const char *mn;
+
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+
+    switch (inst->opcode) {
+    case OP_ALU:
+        mn = alu_name(inst->funct3, inst->funct7);
+        if (mn) {
+            snprintf(buf, buf_size, "%s %s, %s, %s",
+                     mn, rn(inst->rd), rn(inst->rs1), rn(inst->rs2));
+        }
+        break;
+
+    case OP_ALUI:
+        mn = alui_name(inst->funct3, inst->funct7);
+        if (mn) {
+            if (inst->funct3 == 1 || inst->funct3 == 5) {
+                /* 移位: 第三操作数是 shamt */
+                snprintf(buf, buf_size, "%s %s, %s, %u",
+                         mn, rn(inst->rd), rn(inst->rs1), inst->imm & 0x1F);
+            } else {
+                snprintf(buf, buf_size, "%s %s, %s, %d",
+                         mn, rn(inst->rd), rn(inst->rs1), inst->imm);
+            }
+        }
+        break;
+
+    case OP_LOAD:
+        mn = load_name(inst->funct3);
+        if (mn) {
+            snprintf(buf, buf_size, "%s %s, %d(%s)",
+                     mn, rn(inst->rd), inst->imm, rn(inst->rs1));
+        }
+        break;
+
+    case OP_STORE:
+        mn = store_name(inst->funct3);
+        if (mn) {
+            snprintf(buf, buf_size, "%s %s, %d(%s)",
+                     mn, rn(inst->rs2), inst->imm, rn(inst->rs1));
+        }
+        break;
+
+    case OP_BRANCH:
+        mn = branch_name(inst->funct3);
+        if (mn) {
+            snprintf(buf, buf_size, "%s %s, %s, %+d",
+                     mn, rn(inst->rs1), rn(inst->rs2), inst->imm);
+        }
+        break;
+
+    case OP_JAL:
+        snprintf(buf, buf_size, "jal %s, %+d", rn(inst->rd), inst->imm);
+        break;
+
+    case OP_JALR:
+        snprintf(buf, buf_size, "jalr %s, %d(%s)",
+                 rn(inst->rd), inst->imm, rn(inst->rs1));
+        break;
+
+    case OP_LUI:
+        snprintf(buf, buf_size, "lui %s, 0x%X",
+                 rn(inst->rd), (u32)inst->imm >> 12);
+        break;
+
+    case OP_AUIPC:
+        snprintf(buf, buf_size, "auipc %s, 0x%X",
+                 rn(inst->rd), (u32)inst->imm >> 12);
+        break;
+
+    case OP_SYSTEM:
+        if (inst->raw == 0x00000073) {
+            snprintf(buf, buf_size, "ecall");
+        } else if (inst->raw == 0x00100073) {
+            snprintf(buf, buf_size, "ebreak");
+        } else {
+            mn = csr_name(inst->funct3);
+            if (mn) {
+                if (inst->funct3 >= 5) {
+                    snprintf(buf, buf_size, "%s %s, 0x%X, %u",
+                             mn, rn(inst->rd), inst->imm, inst->rs1);
+                } else {
+                    snprintf(buf, buf_size, "%s %s, 0x%X, %s",
+                             mn, rn(inst->rd), inst->imm, rn(inst->rs1));
+                }
+            }
+        }
+        break;
+
+    case OP_FENCE:
+        snprintf(buf, buf_size, "fence");
+        break;
+
+    default:
+        break;
+    }
+
+    /* 没识别的指令统一打印原始机器码 */
+    if (buf[0] == '\0') {
+        snprintf(buf, buf_size, ".word 0x%08X", inst->raw);
+    }
 }

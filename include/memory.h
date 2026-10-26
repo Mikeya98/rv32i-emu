@@ -2,8 +2,12 @@
  * @file    memory.h
  * @brief   RV32I Emulator — 内存模型
  *
- * 64KB 扁平地址空间 (0x00000000 — 0x0000FFFF)。
+ * 1MB 扁平地址空间 (0x00000000 — 0x000FFFFF)。
  * 按字节寻址，支持 8/16/32-bit load/store。
+ *
+ * 早期是 64KB，但 RISC-V 链接脚本通常把代码放在 0x00010000，
+ * 刚好越过 64KB 边界，ELF 加载时整段被裁掉。改成 1MB 后
+ * 常见的裸机程序地址都能放下。
  */
 
 #ifndef _RVEMU_MEMORY_H
@@ -11,7 +15,7 @@
 
 #include "types.h"
 
-#define MEM_SIZE  (64 * 1024)   /* 64KB */
+#define MEM_SIZE  (1024 * 1024)   /* 1MB */
 
 /* 内存区域 */
 typedef struct {

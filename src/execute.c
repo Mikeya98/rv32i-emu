@@ -19,6 +19,39 @@
 static u32 sext8(u32 val)  { return (val & 0x80)   ? (val | 0xFFFFFF00) : val; }
 static u32 sext16(u32 val) { return (val & 0x8000) ? (val | 0xFFFF0000) : val; }
 
+/* =========================== RV32M 除法语义 =========================== */
+/*
+ * RISC-V 的除法不产生异常:
+ *   DIV/DIVU 除以 0      → -1 (全 1)
+ *   DIV  INT_MIN / -1    → INT_MIN (商溢出, 结果按补码回绕)
+ *   REM/REMU 除以 0      → 被除数
+ *   REM  INT_MIN % -1    → 0
+ * C 里 INT_MIN / -1 是未定义行为, 必须先单独判断。
+ */
+static u32 rv_div(u32 a, u32 b)
+{
+    if (b == 0) return 0xFFFFFFFFu;
+    if (a == 0x80000000u && b == 0xFFFFFFFFu) return 0x80000000u;
+    return (u32)((s32)a / (s32)b);
+}
+
+static u32 rv_divu(u32 a, u32 b)
+{
+    return (b == 0) ? 0xFFFFFFFFu : (a / b);
+}
+
+static u32 rv_rem(u32 a, u32 b)
+{
+    if (b == 0) return a;
+    if (a == 0x80000000u && b == 0xFFFFFFFFu) return 0;
+    return (u32)((s32)a % (s32)b);
+}
+
+static u32 rv_remu(u32 a, u32 b)
+{
+    return (b == 0) ? a : (a % b);
+}
+
 /* =========================== 核心 =========================== */
 
 bool execute(emulator_t *emu, decoded_inst_t *inst)
@@ -38,6 +71,40 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== ALU (R-type) ===================== */
     case OP_ALU:
+        /* funct7 = 0x01: RV32M 乘除法 */
+        if (inst->funct7 == 0x01) {
+            switch (inst->funct3) {
+            case 0:  /* MUL: 低 32 位 */
+                result = rs1_val * rs2_val;
+                break;
+            case 1:  /* MULH: 有符号 × 有符号, 高 32 位 */
+                result = (u32)(((s64)(s32)rs1_val * (s64)(s32)rs2_val) >> 32);
+                break;
+            case 2:  /* MULHSU: 有符号 × 无符号, 高 32 位 */
+                result = (u32)(((s64)(s32)rs1_val * (s64)(u64)rs2_val) >> 32);
+                break;
+            case 3:  /* MULHU: 无符号 × 无符号, 高 32 位 */
+                result = (u32)(((u64)rs1_val * (u64)rs2_val) >> 32);
+                break;
+            case 4:  /* DIV */
+                result = rv_div(rs1_val, rs2_val);
+                break;
+            case 5:  /* DIVU */
+                result = rv_divu(rs1_val, rs2_val);
+                break;
+            case 6:  /* REM */
+                result = rv_rem(rs1_val, rs2_val);
+                break;
+            case 7:  /* REMU */
+                result = rv_remu(rs1_val, rs2_val);
+                break;
+            default:
+                goto unknown;
+            }
+            reg_write(&emu->rf, inst->rd, result);
+            break;
+        }
+
         switch (inst->funct3) {
         case F3_ADDSUB: /* ADD 或 SUB */
             result = (inst->funct7 == 0x20)
@@ -201,13 +268,49 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     /* ===================== SYSTEM ===================== */
     case OP_SYSTEM:
         if (inst->funct3 == F3_ECALL) {
-            /* ECALL: a0 (x10) = exit_code, a7 (x17) = syscall number */
+            /*
+             * 系统调用约定 (接近 RISC-V Linux ABI):
+             *   a7 = 调用号, a0-a2 = 参数, 返回值写回 a0
+             *     0 / 93  exit(a0)
+             *     64      write(fd, buf, len) → 直接输出到终端
+             * a7=0 是为了兼容早期自测里"ecall 直接停机"的写法。
+             */
             u32 a0 = reg_read(&emu->rf, 10);
+            u32 a1 = reg_read(&emu->rf, 11);
+            u32 a2 = reg_read(&emu->rf, 12);
             u32 a7 = reg_read(&emu->rf, 17);
-            (void)a7;  /* 暂无不同 syscall 的区分 */
-            emu->state     = EMU_HALTED;
-            emu->exit_code = a0;
-            printf("[SYSTEM] ecall: exit_code=%u\n", a0);
+
+            switch (a7) {
+            case 0:
+            case 93: {
+                emu->state     = EMU_HALTED;
+                emu->exit_code = a0;
+                printf("[SYSTEM] exit(%u)\n", a0);
+                break;
+            }
+
+            case 64: {  /* write: a0=fd, a1=buf, a2=len */
+                u32 i;
+                u32 len = a2;
+
+                if (len > 8192) len = 8192;   /* 防止一次打印半张内存 */
+                for (i = 0; i < len; i++) {
+                    u8 ch;
+                    if (!memory_read8(&emu->mem, a1 + i, &ch)) {
+                        break;
+                    }
+                    putchar(ch);
+                }
+                fflush(stdout);
+                reg_write(&emu->rf, 10, i);   /* 返回实际写出的字节数 */
+                break;
+            }
+
+            default:
+                printf("[SYSTEM] unknown syscall a7=%u (pc=0x%08X)\n", a7, pc);
+                emu->state = EMU_EXCEPTION;
+                break;
+            }
         } else if (inst->funct3 == F3_EBREAK) {
             emu->state     = EMU_HALTED;
             emu->exit_code = 0;
@@ -307,8 +410,8 @@ void execute_selftest(void)
 
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
-    printf("║        RV32I Execute Self-Test                           ║\n");
-    printf("║        ALU + Branch + Jump + Load/Store                  ║\n");
+    printf("║        RV32I/M Execute Self-Test                         ║\n");
+    printf("║        ALU + Branch + Jump + Load/Store + Mul/Div        ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n\n");
 
     /* ==================== ADDI ==================== */
@@ -557,6 +660,51 @@ void execute_selftest(void)
 
     CHECK(emu.state == EMU_HALTED, "ecall → EMU_HALTED");
     CHECK(emu.exit_code == 42,     "exit_code = 42");
+    emu_free(&emu);
+
+    /* ==================== RV32M ==================== */
+    printf("── RV32M (mul/div) ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu.state = EMU_RUNNING;
+
+    /* x1 = 7, x2 = 3 */
+    mem_write_inst(&emu.mem, base,      0x00700093);  /* addi x1, x0, 7  */
+    mem_write_inst(&emu.mem, base + 4,  0x00300113);  /* addi x2, x0, 3  */
+    mem_write_inst(&emu.mem, base + 8,  0x022081B3);  /* mul    x3, x1, x2 */
+    mem_write_inst(&emu.mem, base + 12, 0x02209233);  /* mulh   x4, x1, x2 */
+    mem_write_inst(&emu.mem, base + 16, 0x0220B2B3);  /* mulhu  x5, x1, x2 */
+    mem_write_inst(&emu.mem, base + 20, 0x0220C333);  /* div    x6, x1, x2 */
+    mem_write_inst(&emu.mem, base + 24, 0x0220D3B3);  /* divu   x7, x1, x2 */
+    mem_write_inst(&emu.mem, base + 28, 0x0220E433);  /* rem    x8, x1, x2 */
+    mem_write_inst(&emu.mem, base + 32, 0x0220F4B3);  /* remu   x9, x1, x2 */
+
+    /* x10 = -7 */
+    mem_write_inst(&emu.mem, base + 36, 0xFF900513);  /* addi x10, x0, -7 */
+    mem_write_inst(&emu.mem, base + 40, 0x022545B3);  /* div    x11, x10, x2 */
+    mem_write_inst(&emu.mem, base + 44, 0x02256633);  /* rem    x12, x10, x2 */
+    mem_write_inst(&emu.mem, base + 48, 0x02251833);  /* mulh   x16, x10, x2 */
+
+    /* x13 = 0, 除零 */
+    mem_write_inst(&emu.mem, base + 52, 0x00000693);  /* addi x13, x0, 0 */
+    mem_write_inst(&emu.mem, base + 56, 0x02D0C733);  /* div    x14, x1, x13 */
+    mem_write_inst(&emu.mem, base + 60, 0x02D0E7B3);  /* rem    x15, x1, x13 */
+    mem_write_inst(&emu.mem, base + 64, 0x00000073);  /* ecall */
+
+    emu.rf.pc = base;
+    emu_run(&emu, 18);
+
+    val = reg_read(&emu.rf, 3);   CHECK(val == 21,         "mul    7*3 = 21");
+    val = reg_read(&emu.rf, 4);   CHECK(val == 0,          "mulh   7*3 high = 0");
+    val = reg_read(&emu.rf, 5);   CHECK(val == 0,          "mulhu  7*3 high = 0");
+    val = reg_read(&emu.rf, 6);   CHECK(val == 2,          "div    7/3 = 2");
+    val = reg_read(&emu.rf, 7);   CHECK(val == 2,          "divu   7/3 = 2");
+    val = reg_read(&emu.rf, 8);   CHECK(val == 1,          "rem    7%3 = 1");
+    val = reg_read(&emu.rf, 9);   CHECK(val == 1,          "remu   7%3 = 1");
+    val = reg_read(&emu.rf, 11);  CHECK((s32)val == -2,    "div   -7/3 = -2");
+    val = reg_read(&emu.rf, 12);  CHECK((s32)val == -1,    "rem   -7%3 = -1");
+    val = reg_read(&emu.rf, 16);  CHECK(val == 0xFFFFFFFF, "mulh  -7*3 high = -1");
+    val = reg_read(&emu.rf, 14);  CHECK(val == 0xFFFFFFFF, "div   7/0 = -1");
+    val = reg_read(&emu.rf, 15);  CHECK(val == 7,          "rem   7%0 = 7");
     emu_free(&emu);
 
     /* ==================== 结果汇总 ==================== */

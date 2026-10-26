@@ -99,8 +99,8 @@ riscv-emu/
 │   ├── memory.h
 │   ├── regfile.h
 │   ├── decode.h
-│   ├── execute.h        (待实现)
-│   ├── elf.h             (待实现)
+│   ├── execute.h
+│   ├── elf.h
 │   ├── csr.h
 │   └── emu.h
 ├── src/
@@ -108,12 +108,12 @@ riscv-emu/
 │   ├── memory.c
 │   ├── regfile.c
 │   ├── decode.c
-│   ├── execute.c         (待实现)
-│   ├── elf.c             (待实现)
+│   ├── execute.c
+│   ├── elf.c
 │   ├── csr.c
 │   └── emu.c
 ├── tests/
-│   └── (RISC-V 测试 ELF)
+│   └── gen_demo_elf.py   (Python 小汇编器, 生成 demo.elf)
 └── tech_publishing/
     └── zhihu/
         └── rv/
@@ -122,3 +122,16 @@ riscv-emu/
             ├── ...
             └── 07-跑通真实程序.md
 ```
+
+
+## Phase 5: v0.2 可用性补全 (2026-10-26)
+
+- [x] RV32M 扩展: mul/mulh/mulhsu/mulhu/div/divu/rem/remu
+  - 除零、INT_MIN/-1 溢出按 RISC-V 语义处理
+- [x] ecall 系统调用: a7=93 exit / a7=64 write (兼容 a7=0 停机)
+- [x] 内存从 64KB 扩到 1MB (0x10000 链接地址不再越界)
+- [x] 反汇编器: 真实助记符 + ABI 寄存器名
+- [x] 交互式调试器 `-d`: s/c/r/x/d/b/bl/bd/bc
+- [x] tests/gen_demo_elf.py: 无工具链生成 RV32IM ELF
+- [x] 自测: decode 45 项 + execute 43 项全过
+- [ ] 中断/trap 框架 (mtvec/mepc/mret + 定时器)
