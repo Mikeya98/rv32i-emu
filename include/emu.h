@@ -27,6 +27,11 @@ typedef struct {
     regfile_t   rf;
     csr_t       csr;
 
+    /* 机器定时器 (CLINT 简化版): mtime 每执行一条指令 +1,
+     * 当 mtime >= mtimecmp 时 mip.MTIP 置位。mtimecmp = 0 表示关闭。 */
+    u64         mtime;
+    u64         mtimecmp;
+
     emu_state_t state;
     u32         entry;         /* ELF 入口地址 */
     u32         exit_code;     /* ecall 退出码 */

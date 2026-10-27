@@ -13,6 +13,7 @@
 #include "decode.h"
 #include "execute.h"
 #include "debug.h"
+#include "trap.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -56,8 +57,8 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.2                 │\n");
-    printf("│  RV32I + RV32M + syscall + debugger  │\n");
+    printf("│  RV32I Emulator v0.3                 │\n");
+    printf("│  RV32IM + syscall + trap + debugger  │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
@@ -65,6 +66,7 @@ int main(int argc, char *argv[])
     if (selftest) {
         decode_selftest();
         execute_selftest();
+        trap_selftest();
         emu_free(&emu);
         return 0;
     }

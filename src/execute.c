@@ -11,6 +11,8 @@
  */
 
 #include "execute.h"
+#include "csr.h"
+#include "trap.h"
 #include <stdio.h>
 
 /* =========================== 辅助 =========================== */
@@ -66,6 +68,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     u16 b16;
     u32 b32;
     bool ok;
+    u32 fault_cause = EXC_LOAD_ACCESS;   /* goto except 时带上的异常码 */
 
     switch (inst->opcode) {
 
@@ -178,6 +181,23 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     /* ===================== LOAD ===================== */
     case OP_LOAD:
         addr = rs1_val + inst->imm;
+
+        /* 简化版 CLINT: mtime 低 32 位 (0x0200BFF8), 只读 */
+        if (inst->funct3 == F3_LW && addr == CLINT_MTIME_LO) {
+            reg_write(&emu->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
+            break;
+        }
+
+        /* 对齐检查: 半字必须 2 字节对齐, 字必须 4 字节对齐 */
+        if ((inst->funct3 == F3_LH || inst->funct3 == F3_LHU) && (addr & 1u)) {
+            fault_cause = EXC_LOAD_MISALIGNED;
+            goto except;
+        }
+        if (inst->funct3 == F3_LW && (addr & 3u)) {
+            fault_cause = EXC_LOAD_MISALIGNED;
+            goto except;
+        }
+
         switch (inst->funct3) {
         case F3_LB:   /* LB:  byte, sign-extend */
             if (!memory_read8(&emu->mem, addr, &b8))  goto except;
@@ -208,6 +228,22 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     /* ===================== STORE ===================== */
     case OP_STORE:
         addr = rs1_val + inst->imm;
+
+        if (inst->funct3 == F3_SH && (addr & 1u)) {
+            fault_cause = EXC_STORE_MISALIGNED;
+            goto except;
+        }
+        if (inst->funct3 == F3_SW && (addr & 3u)) {
+            fault_cause = EXC_STORE_MISALIGNED;
+            goto except;
+        }
+
+        /* 简化版 CLINT: mtimecmp 低 32 位 (0x02004000) */
+        if (inst->funct3 == F3_SW && addr == CLINT_MTIMECMP_LO) {
+            emu->mtimecmp = (emu->mtimecmp & 0xFFFFFFFF00000000ULL) | rs2_val;
+            break;
+        }
+
         switch (inst->funct3) {
         case F3_SB:   /* SB: store byte */
             ok = memory_write8(&emu->mem, addr, (u8)(rs2_val & 0xFF));
@@ -221,7 +257,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         default:
             goto unknown;
         }
-        if (!ok) goto except;
+        if (!ok) {
+            fault_cause = EXC_STORE_ACCESS;
+            goto except;
+        }
         break;
 
     /* ===================== BRANCH ===================== */
@@ -267,7 +306,29 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== SYSTEM ===================== */
     case OP_SYSTEM:
-        if (inst->funct3 == F3_ECALL) {
+        /*
+         * ecall / ebreak / mret 的 funct3 都是 0, 不能用 funct3 区分,
+         * 必须按整条指令的值判断。早期只有 ecall 时按 funct3 判断没问题,
+         * 加了 mret 之后 mret 会被误当成 ecall, 一路又陷回 handler。
+         */
+        if (inst->raw == 0x30200073) {
+            /* MRET: 从 trap handler 返回 */
+            next_pc = trap_mret(emu);
+        } else if (inst->funct3 == F3_ECALL) {
+            /*
+             * v0.3: 如果程序装了 trap handler (mtvec != 0), ecall 就是
+             * 一条纯异常的 ecall —— 进 handler, 由软件决定怎么处理。
+             * 没装 handler 时保持 v0.2 的"宿主系统调用"约定 (exit/write),
+             * 这样旧的 demo 不用改。
+             */
+            if (emu->csr.mtvec != 0) {
+                if (!trap_raise(emu, EXC_ECALL_M, 0, pc)) {
+                    emu->state = EMU_EXCEPTION;
+                    return false;
+                }
+                return true;        /* pc 已经被 trap_raise 改到 mtvec */
+            }
+
             /*
              * 系统调用约定 (接近 RISC-V Linux ABI):
              *   a7 = 调用号, a0-a2 = 参数, 返回值写回 a0
@@ -312,6 +373,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 break;
             }
         } else if (inst->funct3 == F3_EBREAK) {
+            if (emu->csr.mtvec != 0) {
+                if (!trap_raise(emu, EXC_BREAKPOINT, 0, pc)) {
+                    emu->state = EMU_EXCEPTION;
+                    return false;
+                }
+                return true;
+            }
             emu->state     = EMU_HALTED;
             emu->exit_code = 0;
             printf("[SYSTEM] ebreak: halted\n");
@@ -322,7 +390,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
             ok  = true;
             csr_val = csr_read(&emu->csr, csr_addr, &ok);
-            if (!ok) goto except;  /* 未知 CSR */
+            if (!ok) {              /* 未知 CSR */
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
 
             switch (inst->funct3) {
             case F3_CSRRW:   /* CSRRW: rd=old_csr, csr=rs1 */
@@ -348,7 +419,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             }
 
             csr_write(&emu->csr, csr_addr, wdata, &ok);
-            if (!ok) goto except;
+            if (!ok) {
+                fault_cause = EXC_ILLEGAL_INST;   /* 不存在的 CSR 属于非法指令 */
+                goto except;
+            }
 
             /* 回写旧 CSR 值到 rd（rd=x0 则丢弃） */
             if (inst->rd != 0) {
@@ -372,12 +446,23 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     return true;
 
 unknown:
+    /* 装过 handler 就按非法指令陷入, 否则还是老的"停机报错" */
+    if (trap_raise(emu, EXC_ILLEGAL_INST, inst->raw, pc)) {
+        return true;
+    }
     printf("[EXEC] UNKNOWN instruction: raw=0x%08X opcode=0x%02X f3=%u f7=%u\n",
            inst->raw, inst->opcode, inst->funct3, inst->funct7);
     emu->state = EMU_EXCEPTION;
     return false;
 
 except:
+    {
+        u32 tval = (fault_cause == EXC_ILLEGAL_INST) ? inst->raw : addr;
+
+        if (trap_raise(emu, fault_cause, tval, pc)) {
+            return true;        /* handler 接手, pc 已改 */
+        }
+    }
     printf("[EXEC] MEMORY/CSR exception at pc=0x%08X addr=0x%08X\n", pc, addr);
     emu->state = EMU_EXCEPTION;
     return false;

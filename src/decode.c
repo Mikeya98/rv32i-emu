@@ -272,6 +272,8 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
             snprintf(buf, buf_size, "ecall");
         } else if (inst->raw == 0x00100073) {
             snprintf(buf, buf_size, "ebreak");
+        } else if (inst->raw == 0x30200073) {
+            snprintf(buf, buf_size, "mret");
         } else {
             mn = csr_name(inst->funct3);
             if (mn) {

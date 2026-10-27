@@ -168,10 +168,73 @@ class Assembler:
                 out += struct.pack("<I", s_type(imm, rs2, rs1, 0))
                 addr += 4
 
+            elif mn == "sw":
+                rs2, rs1, imm = args
+                out += struct.pack("<I", s_type(imm, rs2, rs1, 2))
+                addr += 4
+
+            elif mn == "lw":
+                rd, rs1, imm = args
+                out += struct.pack("<I", i_type(imm, rs1, 2, rd, 0x03))
+                addr += 4
+
+            elif mn == "li":
+                rd, imm = args
+                out += struct.pack("<I", i_type(imm, 0, 0, rd, 0x13))
+                addr += 4
+
             elif mn == "bne":
                 rs1, rs2, label = args
                 off = labels[label] - addr
                 out += struct.pack("<I", b_type(off, rs2, rs1, 1))
+                addr += 4
+
+            elif mn == "beq":
+                rs1, rs2, label = args
+                off = labels[label] - addr
+                out += struct.pack("<I", b_type(off, rs2, rs1, 0))
+                addr += 4
+
+            elif mn == "blt":
+                rs1, rs2, label = args
+                off = labels[label] - addr
+                out += struct.pack("<I", b_type(off, rs2, rs1, 4))
+                addr += 4
+
+            elif mn == "mret":
+                out += struct.pack("<I", 0x30200073)
+                addr += 4
+
+            elif mn in ("csrrw", "csrrs", "csrrc"):
+                rd, csr, rs1 = args
+                f3 = {"csrrw": 1, "csrrs": 2, "csrrc": 3}[mn]
+                out += struct.pack("<I", i_type(csr, rs1, f3, rd, 0x73))
+                addr += 4
+
+            elif mn in ("csrrwi", "csrrsi", "csrrci"):
+                rd, csr, uimm = args
+                f3 = {"csrrwi": 5, "csrrsi": 6, "csrrci": 7}[mn]
+                out += struct.pack("<I", i_type(csr, uimm, f3, rd, 0x73))
+                addr += 4
+
+            elif mn == "csrw":          # csrw csr, rs  → csrrw x0, csr, rs
+                csr, rs1 = args
+                out += struct.pack("<I", i_type(csr, rs1, 1, 0, 0x73))
+                addr += 4
+
+            elif mn == "csrr":          # csrr rd, csr  → csrrs rd, csr, x0
+                rd, csr = args
+                out += struct.pack("<I", i_type(csr, 0, 2, rd, 0x73))
+                addr += 4
+
+            elif mn == "csrs":          # csrs csr, rs  → csrrs x0, csr, rs
+                csr, rs1 = args
+                out += struct.pack("<I", i_type(csr, rs1, 2, 0, 0x73))
+                addr += 4
+
+            elif mn == "csrci":         # csrci csr, uimm → csrrci x0, csr, uimm
+                csr, uimm = args
+                out += struct.pack("<I", i_type(csr, uimm, 7, 0, 0x73))
                 addr += 4
 
             elif mn == "bnez":

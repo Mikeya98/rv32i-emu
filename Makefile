@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo
+.PHONY: all clean run test demo debug-demo trap-demo
 
 all: $(TARGET)
 
@@ -32,6 +32,12 @@ demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_demo_elf.py $(BUILDDIR)/demo.elf
 	$(TARGET) $(BUILDDIR)/demo.elf
+
+# trap 框架 demo: ecall 陷入 + mret 返回 + 定时器中断
+trap-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_trap_demo.py $(BUILDDIR)/trap_demo.elf
+	$(TARGET) $(BUILDDIR)/trap_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

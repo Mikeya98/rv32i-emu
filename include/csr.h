@@ -2,12 +2,14 @@
  * @file    csr.h
  * @brief   RV32I Emulator — CSR (Control & Status Registers)
  *
- * 最小特权架构:
- *   - mtvec    (0x305): trap 向量基址
- *   - mepc     (0x341): 异常返回地址
- *   - mcause   (0x342): 异常原因
- *   - mstatus  (0x300): 机器状态 (MIE bit)
+ * 最小特权架构 (v0.3 起支持 trap):
+ *   - mstatus  (0x300): 机器状态 (MIE/MPIE/MPP)
  *   - mie      (0x304): 中断使能
+ *   - mtvec    (0x305): trap 向量基址
+ *   - mscratch (0x340): 机器模式暂存寄存器
+ *   - mepc     (0x341): trap 返回地址
+ *   - mcause   (0x342): trap 原因
+ *   - mtval    (0x343): trap 附加信息 (故障地址 / 指令)
  *   - mip      (0x344): 中断 pending
  *   - mcycle   (0xB00): 周期计数器
  */
@@ -19,24 +21,54 @@
 
 /* CSR 地址 */
 #define CSR_MSTATUS     0x300
+#define CSR_MIE         0x304
 #define CSR_MTVEC       0x305
+#define CSR_MSCRATCH    0x340
 #define CSR_MEPC        0x341
 #define CSR_MCAUSE      0x342
-#define CSR_MIE         0x304
+#define CSR_MTVAL       0x343
 #define CSR_MIP         0x344
 #define CSR_MCYCLE      0xB00
 
 #define CSR_MMIO_BASE   0x20000000  /* 简易 MMIO 基址 */
 #define CSR_MMIO_UART   0x20000000  /* UART 输出 (写字节即打印) */
 
-/* mcause 值 */
-#define MCAUSE_ECALL    11   /* Environment call from M-mode */
+/* CLINT 简化版: 只实现 mtime / mtimecmp 的低 32 位 (地址与真实 CLINT 一致) */
+#define CLINT_MTIMECMP_LO  0x02004000u
+#define CLINT_MTIME_LO     0x0200BFF8u
+
+/* mstatus 位 */
+#define MSTATUS_MIE        (1u << 3)    /* 全局中断使能 */
+#define MSTATUS_MPIE       (1u << 7)    /* trap 前的 MIE 备份 */
+#define MSTATUS_MPP_MASK   (3u << 11)   /* 特权级备份 */
+#define MSTATUS_MPP_M      (3u << 11)   /* 11 = M-mode */
+
+/* mie / mip 位 */
+#define MIE_MTIE           (1u << 7)    /* 机器定时器中断使能 */
+#define MIP_MTIP           (1u << 7)    /* 机器定时器中断 pending */
+
+/* mcause: 最高位 = 1 表示中断, 否则是异常 */
+#define MCAUSE_IRQ_BIT     0x80000000u
+#define MCAUSE_IRQ_TIMER   (MCAUSE_IRQ_BIT | 7)   /* 7 = machine timer */
+
+/* 异常码 (和 RISC-V 规范一致) */
+#define EXC_INST_MISALIGNED  0
+#define EXC_INST_ACCESS      1
+#define EXC_ILLEGAL_INST     2
+#define EXC_BREAKPOINT       3
+#define EXC_LOAD_MISALIGNED  4
+#define EXC_LOAD_ACCESS      5
+#define EXC_STORE_MISALIGNED 6
+#define EXC_STORE_ACCESS     7
+#define EXC_ECALL_M          11
 
 typedef struct {
     u32  mstatus;
     u32  mtvec;
     u32  mepc;
     u32  mcause;
+    u32  mtval;
+    u32  mscratch;
     u32  mie;
     u32  mip;
     u64  mcycle;       /* 64-bit wide */

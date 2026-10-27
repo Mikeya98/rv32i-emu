@@ -8,6 +8,7 @@
 #include "emu.h"
 #include "elf.h"
 #include "execute.h"
+#include "trap.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -18,6 +19,7 @@ void emu_init(emulator_t *emu, u32 mem_size)
     memory_init(&emu->mem);
     regfile_init(&emu->rf);
     csr_init(&emu->csr);
+    trap_init(emu);
 
     emu->state     = EMU_HALTED;
     emu->entry     = 0;
@@ -70,8 +72,33 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
     u32 raw;
     u32 pc = emu->rf.pc;
 
+    /*
+     * 0. 指令边界上检查定时器中断。
+     *
+     * 中断是异步的, 只能在两条指令之间进来。trap_check_interrupt
+     * 顺便把 mtime 往前推一格。
+     */
+    if (trap_check_interrupt(emu, pc)) {
+        emu->csr.mcycle++;
+        return true;            /* 这一"步"没有执行指令, 但跳进了 handler */
+    }
+
     /* 1. Fetch: 从内存取出 32-bit 指令 */
+    if ((pc & 3u) != 0) {
+        if (trap_raise(emu, EXC_INST_MISALIGNED, pc, pc)) {
+            emu->csr.mcycle++;
+            return true;
+        }
+        printf("[EMU] misaligned pc=0x%08X\n", pc);
+        emu->state = EMU_EXCEPTION;
+        return false;
+    }
+
     if (!memory_read32(&emu->mem, pc, &raw)) {
+        if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
+            emu->csr.mcycle++;
+            return true;
+        }
         printf("[EMU] fetch failed at pc=0x%08X\n", pc);
         emu->state = EMU_EXCEPTION;
         return false;
@@ -79,6 +106,10 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 
     /* 2. Decode */
     if (!decode(raw, inst_out)) {
+        if (trap_raise(emu, EXC_ILLEGAL_INST, raw, pc)) {
+            emu->csr.mcycle++;
+            return true;
+        }
         printf("[EMU] decode failed at pc=0x%08X raw=0x%08X\n", pc, raw);
         emu->state = EMU_EXCEPTION;
         return false;
