@@ -31,7 +31,10 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
      * mstatus 的三个位:
      *   MPIE ← MIE   记住进 trap 之前中断是开还是关
      *   MIE  ← 0     进 handler 之后先关中断, 防止嵌套
-     *   MPP  ← 11    记下 trap 来自 M 态
+     *   MPP  ← 当前特权级
+     *
+     * v0.4 之后 MPP 不能写死成 M: U 态来的 trap 记 00, mret 才能
+     * 正确回到 U 态。写死 11 的话 mret 永远回 M, 用户态根本出不去。
      */
     m = csr->mstatus;
     if (m & MSTATUS_MIE) {
@@ -40,9 +43,12 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
         m &= ~MSTATUS_MPIE;
     }
     m &= ~MSTATUS_MIE;
-    m = (m & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_M;
+    m = (m & ~MSTATUS_MPP_MASK) | ((emu->priv & 0x3u) << 11);
 
     csr->mstatus = m;
+
+    /* 进 trap 一律在 M 态执行 handler */
+    emu->priv = PRIV_M;
 
     emu->rf.pc = csr->mtvec;
     return true;
@@ -65,9 +71,13 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
         csr->mip &= ~MIP_MTIP;
     }
 
+    /*
+     * M 态取中断看 mstatus.MIE; U 态可以直接被 M 态中断打断
+     * (规范和真机都是这样 —— 低特权级挡不住高特权级的中断)。
+     */
     if ((csr->mip & MIP_MTIP) &&
         (csr->mie & MIE_MTIE) &&
-        (csr->mstatus & MSTATUS_MIE)) {
+        (emu->priv == PRIV_U || (csr->mstatus & MSTATUS_MIE))) {
         return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
     }
 
@@ -85,7 +95,13 @@ u32 trap_mret(emulator_t *emu)
         m &= ~MSTATUS_MIE;
     }
     m |= MSTATUS_MPIE;                      /* mret 之后 MPIE 恒为 1 */
-    m = (m & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_M;   /* 只有 M 态 */
+
+    /*
+     * 特权级回到 MPP 记录的那一级, MPP 复位成"所支持的最低特权级"。
+     * 本模拟器只支持 M/U, 所以 MPP 清成 00 (U)。
+     */
+    emu->priv = (m & MSTATUS_MPP_MASK) >> 11;
+    m = (m & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_U;
 
     csr->mstatus = m;
 

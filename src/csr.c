@@ -18,6 +18,7 @@ u32 csr_read(csr_t *csr, u32 addr, bool *ok)
 
     switch (addr) {
     case CSR_MSTATUS:  return csr->mstatus;
+    case CSR_SATP:     return csr->satp;
     case CSR_MIE:      return csr->mie;
     case CSR_MTVEC:    return csr->mtvec;
     case CSR_MSCRATCH: return csr->mscratch;
@@ -38,6 +39,18 @@ void csr_write(csr_t *csr, u32 addr, u32 val, bool *ok)
 
     switch (addr) {
     case CSR_MSTATUS:  csr->mstatus  = val; break;
+    /*
+     * satp (v0.4): 只实现 Sv32。MODE 只接受 0 (bare) 和 1 (Sv32),
+     * 别的值按规范是 WARL, 这里选择保持原值不变 (拒绝写入)。
+     */
+    case CSR_SATP:
+        if ((val & SATP_MODE_BIT) == 0) {
+            csr->satp = 0;                  /* MODE = 0: bare */
+        } else {
+            /* MODE = 1: Sv32, 保留 ASID[30:22] 和 PPN[21:0] */
+            csr->satp = val & (SATP_MODE_BIT | (0x1FFu << 22) | SATP_PPN_MASK);
+        }
+        break;
     case CSR_MIE:      csr->mie      = val; break;
     case CSR_MTVEC:    csr->mtvec    = val & ~0x3u; break;  /* 低两位是模式 */
     case CSR_MSCRATCH: csr->mscratch = val; break;
@@ -60,6 +73,10 @@ void csr_dump(csr_t *csr)
            (csr->mstatus & MSTATUS_MIE) ? 1u : 0u,
            (csr->mstatus & MSTATUS_MPIE) ? 1u : 0u,
            (csr->mstatus & MSTATUS_MPP_MASK) >> 11);
+    printf("  satp     = 0x%08X  (mode=%s root=0x%X)\n",
+           csr->satp,
+           (csr->satp & 0x80000000u) ? "Sv32" : "bare",
+           (csr->satp & 0x003FFFFFu) << 12);
     printf("  mtvec    = 0x%08X\n", csr->mtvec);
     printf("  mepc     = 0x%08X\n", csr->mepc);
     printf("  mcause   = 0x%08X%s\n", csr->mcause,

@@ -130,7 +130,11 @@ static const char *state_name(emu_state_t s)
 
 static void show_status(emulator_t *emu)
 {
-    printf("[%s] pc=0x%08X", state_name(emu->state), emu->rf.pc);
+    printf("[%s] pc=0x%08X priv=%s", state_name(emu->state), emu->rf.pc,
+           (emu->priv == PRIV_M) ? "M" : "U");
+    if (emu->csr.satp & SATP_MODE_BIT) {
+        printf(" satp=Sv32@0x%X", (emu->csr.satp & SATP_PPN_MASK) << 12);
+    }
     if (emu->state == EMU_HALTED) {
         printf("  exit_code=%u", emu->exit_code);
     }

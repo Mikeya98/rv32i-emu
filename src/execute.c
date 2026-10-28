@@ -13,6 +13,7 @@
 #include "execute.h"
 #include "csr.h"
 #include "trap.h"
+#include "mmu.h"
 #include <stdio.h>
 
 /* =========================== 辅助 =========================== */
@@ -64,6 +65,8 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     u32 rs2_val = reg_read(&emu->rf, inst->rs2);
     u32 result  = 0;
     u32 addr = 0;
+    u32 pa   = 0;
+    int  xrc;
     u8  b8;
     u16 b16;
     u32 b32;
@@ -182,12 +185,6 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     case OP_LOAD:
         addr = rs1_val + inst->imm;
 
-        /* 简化版 CLINT: mtime 低 32 位 (0x0200BFF8), 只读 */
-        if (inst->funct3 == F3_LW && addr == CLINT_MTIME_LO) {
-            reg_write(&emu->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
-            break;
-        }
-
         /* 对齐检查: 半字必须 2 字节对齐, 字必须 4 字节对齐 */
         if ((inst->funct3 == F3_LH || inst->funct3 == F3_LHU) && (addr & 1u)) {
             fault_cause = EXC_LOAD_MISALIGNED;
@@ -198,25 +195,42 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             goto except;
         }
 
+        /*
+         * v0.4: 先翻译再访存。
+         * U 态走 satp 页表, M 态直通 —— 翻译函数内部区分。
+         * 页表错误按 13 (load page fault) 报, mtval 是虚拟地址。
+         */
+        xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
+        if (xrc != 0) {
+            fault_cause = xrc;
+            goto except;
+        }
+
+        /* 简化版 CLINT: mtime 低 32 位 (0x0200BFF8), 只读 */
+        if (inst->funct3 == F3_LW && pa == CLINT_MTIME_LO) {
+            reg_write(&emu->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
+            break;
+        }
+
         switch (inst->funct3) {
         case F3_LB:   /* LB:  byte, sign-extend */
-            if (!memory_read8(&emu->mem, addr, &b8))  goto except;
+            if (!memory_read8(&emu->mem, pa, &b8))  goto except;
             result = sext8(b8);
             break;
         case F3_LH:   /* LH:  halfword, sign-extend */
-            if (!memory_read16(&emu->mem, addr, &b16)) goto except;
+            if (!memory_read16(&emu->mem, pa, &b16)) goto except;
             result = sext16(b16);
             break;
         case F3_LW:   /* LW:  word */
-            if (!memory_read32(&emu->mem, addr, &b32)) goto except;
+            if (!memory_read32(&emu->mem, pa, &b32)) goto except;
             result = b32;
             break;
         case F3_LBU:  /* LBU: byte, zero-extend */
-            if (!memory_read8(&emu->mem, addr, &b8))  goto except;
+            if (!memory_read8(&emu->mem, pa, &b8))  goto except;
             result = b8;
             break;
         case F3_LHU:  /* LHU: halfword, zero-extend */
-            if (!memory_read16(&emu->mem, addr, &b16)) goto except;
+            if (!memory_read16(&emu->mem, pa, &b16)) goto except;
             result = b16;
             break;
         default:
@@ -238,21 +252,28 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             goto except;
         }
 
+        /* v0.4: 写也要先翻译, 失败按 15 (store page fault) 报 */
+        xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+        if (xrc != 0) {
+            fault_cause = xrc;
+            goto except;
+        }
+
         /* 简化版 CLINT: mtimecmp 低 32 位 (0x02004000) */
-        if (inst->funct3 == F3_SW && addr == CLINT_MTIMECMP_LO) {
+        if (inst->funct3 == F3_SW && pa == CLINT_MTIMECMP_LO) {
             emu->mtimecmp = (emu->mtimecmp & 0xFFFFFFFF00000000ULL) | rs2_val;
             break;
         }
 
         switch (inst->funct3) {
         case F3_SB:   /* SB: store byte */
-            ok = memory_write8(&emu->mem, addr, (u8)(rs2_val & 0xFF));
+            ok = memory_write8(&emu->mem, pa, (u8)(rs2_val & 0xFF));
             break;
         case F3_SH:   /* SH: store halfword */
-            ok = memory_write16(&emu->mem, addr, (u16)(rs2_val & 0xFFFF));
+            ok = memory_write16(&emu->mem, pa, (u16)(rs2_val & 0xFFFF));
             break;
         case F3_SW:   /* SW: store word */
-            ok = memory_write32(&emu->mem, addr, rs2_val);
+            ok = memory_write32(&emu->mem, pa, rs2_val);
             break;
         default:
             goto unknown;
@@ -312,8 +333,24 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
          * 加了 mret 之后 mret 会被误当成 ecall, 一路又陷回 handler。
          */
         if (inst->raw == 0x30200073) {
-            /* MRET: 从 trap handler 返回 */
+            /* MRET: 从 trap handler 返回。U 态执行它属于非法指令 */
+            if (emu->priv != PRIV_M) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
             next_pc = trap_mret(emu);
+        } else if ((inst->raw & 0xFE007FFFu) == 0x12000073u) {
+            /*
+             * SFENCE.VMA (v0.4): 刷 TLB。
+             *
+             * 这个模拟器每次访存都重新走页表, 没有 TLB 要刷, 所以
+             * 真正要做的事只有一件: 检查特权级。真实 CPU 上它是
+             * M/S 态指令, U 态执行会陷非法指令。
+             */
+            if (emu->priv != PRIV_M) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
         } else if (inst->funct3 == F3_ECALL) {
             /*
              * v0.3: 如果程序装了 trap handler (mtvec != 0), ecall 就是
@@ -322,11 +359,26 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 这样旧的 demo 不用改。
              */
             if (emu->csr.mtvec != 0) {
-                if (!trap_raise(emu, EXC_ECALL_M, 0, pc)) {
+                /*
+                 * v0.4: ecall 的 mcause 取决于来源特权级
+                 *   M 态 → 11, U 态 → 8
+                 */
+                u32 cause = (emu->priv == PRIV_M) ? EXC_ECALL_M : EXC_ECALL_U;
+                if (!trap_raise(emu, cause, 0, pc)) {
                     emu->state = EMU_EXCEPTION;
                     return false;
                 }
                 return true;        /* pc 已经被 trap_raise 改到 mtvec */
+            }
+
+            /*
+             * 没装 handler 时只有 M 态还能用宿主系统调用;
+             * U 态裸跑没有意义 (没有内核可陷), 当未处理异常。
+             */
+            if (emu->priv != PRIV_M) {
+                printf("[EXEC] ecall from U-mode without handler at pc=0x%08X\n", pc);
+                emu->state = EMU_EXCEPTION;
+                return false;
             }
 
             /*
@@ -387,6 +439,16 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             /* CSR 指令 */
             u32 csr_addr = inst->imm;  /* CSR 地址在 imm 字段 */
             u32 csr_val, wdata;
+
+            /*
+             * v0.4: 本模拟器实现的 CSR 全部是 M 态寄存器,
+             * U 态访问一律按非法指令处理 (真实 CPU 也是这个行为,
+             * 除非该 CSR 在规范里本身就是非特权寄存器)。
+             */
+            if (emu->priv != PRIV_M) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
 
             ok  = true;
             csr_val = csr_read(&emu->csr, csr_addr, &ok);

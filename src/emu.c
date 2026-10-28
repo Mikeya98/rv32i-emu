@@ -9,6 +9,7 @@
 #include "elf.h"
 #include "execute.h"
 #include "trap.h"
+#include "mmu.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -20,6 +21,8 @@ void emu_init(emulator_t *emu, u32 mem_size)
     regfile_init(&emu->rf);
     csr_init(&emu->csr);
     trap_init(emu);
+
+    emu->priv = PRIV_M;         /* 复位进 M 态 */
 
     emu->state     = EMU_HALTED;
     emu->entry     = 0;
@@ -94,14 +97,34 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         return false;
     }
 
-    if (!memory_read32(&emu->mem, pc, &raw)) {
-        if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
-            emu->csr.mcycle++;
-            return true;
+    /*
+     * v0.4: 取指也要过页表。
+     * U 态执行到一页没有 X 权限的内存, 或者干脆没映射的地址, 就在这里
+     * 报 12 (instruction page fault), mtval = 出错的 PC。
+     */
+    {
+        u32 fetch_pa = 0;
+        int frc = mmu_translate(emu, pc, ACC_FETCH, &fetch_pa);
+
+        if (frc != 0) {
+            if (trap_raise(emu, (u32)frc, pc, pc)) {
+                emu->csr.mcycle++;
+                return true;
+            }
+            printf("[EMU] fetch page fault at pc=0x%08X\n", pc);
+            emu->state = EMU_EXCEPTION;
+            return false;
         }
-        printf("[EMU] fetch failed at pc=0x%08X\n", pc);
-        emu->state = EMU_EXCEPTION;
-        return false;
+
+        if (!memory_read32(&emu->mem, fetch_pa, &raw)) {
+            if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
+                emu->csr.mcycle++;
+                return true;
+            }
+            printf("[EMU] fetch failed at pc=0x%08X\n", pc);
+            emu->state = EMU_EXCEPTION;
+            return false;
+        }
     }
 
     /* 2. Decode */

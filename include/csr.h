@@ -12,6 +12,7 @@
  *   - mtval    (0x343): trap 附加信息 (故障地址 / 指令)
  *   - mip      (0x344): 中断 pending
  *   - mcycle   (0xB00): 周期计数器
+ *   - satp     (0x180): 地址空间标识 + Sv32 页表根 (v0.4)
  */
 
 #ifndef _RVEMU_CSR_H
@@ -29,6 +30,11 @@
 #define CSR_MTVAL       0x343
 #define CSR_MIP         0x344
 #define CSR_MCYCLE      0xB00
+#define CSR_SATP        0x180
+
+/* satp 字段 (Sv32) */
+#define SATP_MODE_BIT    (1u << 31)     /* 1 = Sv32, 0 = bare */
+#define SATP_PPN_MASK    0x003FFFFFu
 
 #define CSR_MMIO_BASE   0x20000000  /* 简易 MMIO 基址 */
 #define CSR_MMIO_UART   0x20000000  /* UART 输出 (写字节即打印) */
@@ -42,6 +48,12 @@
 #define MSTATUS_MPIE       (1u << 7)    /* trap 前的 MIE 备份 */
 #define MSTATUS_MPP_MASK   (3u << 11)   /* 特权级备份 */
 #define MSTATUS_MPP_M      (3u << 11)   /* 11 = M-mode */
+#define MSTATUS_MPP_U      (0u << 11)   /* 00 = U-mode (v0.4) */
+
+/* 特权级编码 (和 RISC-V 规范一致) */
+#define PRIV_U             0u
+#define PRIV_S             1u
+#define PRIV_M             3u
 
 /* mie / mip 位 */
 #define MIE_MTIE           (1u << 7)    /* 机器定时器中断使能 */
@@ -60,10 +72,15 @@
 #define EXC_LOAD_ACCESS      5
 #define EXC_STORE_MISALIGNED 6
 #define EXC_STORE_ACCESS     7
+#define EXC_ECALL_U          8
 #define EXC_ECALL_M          11
+#define EXC_INST_PAGE_FAULT  12
+#define EXC_LOAD_PAGE_FAULT  13
+#define EXC_STORE_PAGE_FAULT 15
 
 typedef struct {
     u32  mstatus;
+    u32  satp;         /* Sv32: MODE[31] | ASID[30:22] | PPN[21:0] */
     u32  mtvec;
     u32  mepc;
     u32  mcause;

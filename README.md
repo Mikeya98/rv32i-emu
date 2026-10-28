@@ -18,8 +18,10 @@
 - **交互式调试器** — 单步、继续、断点、寄存器、内存、反汇编
 - **CSR** — mstatus/mie/mtvec/mscratch/mepc/mcause/mtval/mip/mcycle
 - **trap 框架** — 异常（ecall / 非法指令 / 访存错误 / 非对齐）和中断（机器定时器）统一进入 mtvec，`mret` 返回
+- **Sv32 分页** — 两级页表（4KB 页 + 4MB 大页）、satp、PTE 权限位（V/R/W/X/U/A/D）、取指/读/写三类缺页（mcause 12/13/15）
+- **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 45 项 + 执行 43 项 + trap 20 项，`make test` 全过
+- **自测** — 解码 45 项 + 执行 43 项 + trap 20 项 + Sv32/特权级 27 项，`make test` 全过
 
 ## 快速开始
 
@@ -37,6 +39,9 @@ make demo
 
 # trap demo：ecall 陷入 + mret 返回 + 定时器中断
 make trap-demo
+
+# Sv32 demo：M 态建页表 → mret 进 U 态 → 缺页 / 非法指令
+make sv32-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -93,6 +98,7 @@ main.c → emu.c (fetch→decode→execute)
            ├── execute.c   执行引擎 (RV32I + RV32M + ecall)
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
+           ├── mmu.c       Sv32 分页 (页表遍历 / 权限 / A-D 位)
            ├── regfile.c   寄存器文件 (x0-x31 + PC)
            ├── memory.c    1MB 内存 + MMIO UART
            └── csr.c       CSR 控制寄存器
@@ -119,6 +125,20 @@ $ make trap-demo
 [SYSTEM] exit(0)
 ```
 
+`tests/gen_sv32_demo.py` 演示分页和特权级。M 态先在物理内存里建好两级页表（代码页 identity 映射、数据页、只读页、一个 4MB 大页、一个故意不映射的地址），写 satp 后用 `mret` 进入 U 态。U 态依次做五件事，每一件的成功或陷入都会打一个字符：
+
+```
+$ make sv32-demo
+WSIPF
+[SYSTEM] exit(0)
+```
+
+- `W` — 往 0x40000000（VA）写数再读回，经过页表翻译落到物理页 0x83000
+- `S` — 从 4MB 大页 0xC0010000 读到一个字（一级页表叶子项）
+- `I` — U 态执行 `csrr mstatus`，非法指令陷入（mcause 2），handler 跳过它继续
+- `P` — 往只读页 0x40001000 写，store page fault（mcause 15），mtval 是虚拟地址
+- `F` — 读未映射的 0x50000000，load page fault（mcause 13），handler 把特权级改回 M 后退出
+
 ## 进度
 
 | 模块 | 状态 |
@@ -134,6 +154,8 @@ $ make trap-demo
 | ecall 系统调用 (exit/write) | ✅ |
 | 交互式调试器 | ✅ |
 | trap 框架 (异常 + 定时器中断 + mret) | ✅ |
+| Sv32 分页 (4KB 页 / 4MB 大页 / 权限 / A-D) | ✅ |
+| U 态 + 特权级切换 (MPP / mret / 特权指令陷入) | ✅ |
 
 ## License
 

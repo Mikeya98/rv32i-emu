@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo
 
 all: $(TARGET)
 
@@ -38,6 +38,12 @@ trap-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_trap_demo.py $(BUILDDIR)/trap_demo.elf
 	$(TARGET) $(BUILDDIR)/trap_demo.elf
+
+# Sv32 分页 + U 态 demo: 建页表 → mret 进 U 态 → 缺页/非法指令
+sv32-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_sv32_demo.py $(BUILDDIR)/sv32_demo.elf
+	$(TARGET) $(BUILDDIR)/sv32_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

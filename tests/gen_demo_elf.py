@@ -67,6 +67,10 @@ def u_type(imm20, rd, op):
     return ((imm20 & 0xFFFFF) << 12) | ((reg(rd) & 0x1F) << 7) | (op & 0x7F)
 
 
+def j_type(imm, rd, op=0x6F):
+    return (((imm >> 20) & 1) << 31) | (((imm >> 1) & 0x3FF) << 21) |            (((imm >> 11) & 1) << 20) | (((imm >> 12) & 0xFF) << 12) |            ((reg(rd) & 0x1F) << 7) | (op & 0x7F)
+
+
 # =========================== 小汇编器 ===========================
 
 class Assembler:
@@ -241,6 +245,18 @@ class Assembler:
                 rs1, label = args
                 off = labels[label] - addr
                 out += struct.pack("<I", b_type(off, 0, rs1, 1))
+                addr += 4
+
+            elif mn == "jal":
+                rd, label = args
+                off = labels[label] - addr
+                out += struct.pack("<I", j_type(off, rd))
+                addr += 4
+
+            elif mn == "j":             # j label → jal x0, label
+                label, = args
+                off = labels[label] - addr
+                out += struct.pack("<I", j_type(off, 0))
                 addr += 4
 
             elif mn == "ecall":

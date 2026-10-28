@@ -32,6 +32,12 @@ typedef struct {
     u64         mtime;
     u64         mtimecmp;
 
+    /*
+     * 当前特权级 (v0.4): PRIV_M = 3 复位值, PRIV_U = 0。
+     * 只实现 M/U 两级: M 态访存直通物理地址, U 态走 satp 页表。
+     */
+    u32         priv;
+
     emu_state_t state;
     u32         entry;         /* ELF 入口地址 */
     u32         exit_code;     /* ecall 退出码 */
