@@ -20,8 +20,9 @@
 - **trap 框架** — 异常（ecall / 非法指令 / 访存错误 / 非对齐）和中断（机器定时器）统一进入 mtvec，`mret` 返回
 - **Sv32 分页** — 两级页表（4KB 页 + 4MB 大页）、satp、PTE 权限位（V/R/W/X/U/A/D）、取指/读/写三类缺页（mcause 12/13/15）
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
+- **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 45 项 + 执行 43 项 + trap 20 项 + Sv32/特权级 27 项，`make test` 全过
+- **自测** — 解码 45 项 + 执行 43 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，`make test` 全过
 
 ## 快速开始
 
@@ -42,6 +43,9 @@ make trap-demo
 
 # Sv32 demo：M 态建页表 → mret 进 U 态 → 缺页 / 非法指令
 make sv32-demo
+
+# S 态 demo：U 态 ecall 委托给 S 态 handler → sret 返回
+make s-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -139,6 +143,18 @@ WSIPF
 - `P` — 往只读页 0x40001000 写，store page fault（mcause 15），mtval 是虚拟地址
 - `F` — 读未映射的 0x50000000，load page fault（mcause 13），handler 把特权级改回 M 后退出
 
+`tests/gen_s_demo.py` 演示 S 态和异常委托。M 态只设置 `stvec` 和 `medeleg[8]`（只委托 U 态 ecall），然后 `mret` 进 U 态。U 态执行 `ecall` 时，trap 不经过 M 态，直接进入 S 态 handler；handler 检查 `scause == 8`、把 `sepc` 加 4、`sret` 回到 U 态：
+
+```
+$ make s-demo
+S8U
+[SYSTEM] ebreak: halted
+```
+
+- `S` — S 态 handler 开始执行
+- `8` — `scause` 是 8（ecall from U），说明委托生效
+- `U` — `sret` 正常回到 U 态，下一条指令继续执行
+
 ## 进度
 
 | 模块 | 状态 |
@@ -156,6 +172,7 @@ WSIPF
 | trap 框架 (异常 + 定时器中断 + mret) | ✅ |
 | Sv32 分页 (4KB 页 / 4MB 大页 / 权限 / A-D) | ✅ |
 | U 态 + 特权级切换 (MPP / mret / 特权指令陷入) | ✅ |
+| S 态 + 异常委托 (medeleg / mideleg / stvec / sret / SUM) | ✅ |
 
 ## License
 

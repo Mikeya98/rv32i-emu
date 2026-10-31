@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo
 
 all: $(TARGET)
 
@@ -44,6 +44,12 @@ sv32-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_sv32_demo.py $(BUILDDIR)/sv32_demo.elf
 	$(TARGET) $(BUILDDIR)/sv32_demo.elf
+
+# S 态 + 异常委托 demo: U ecall → stvec → sret → U
+s-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_s_demo.py $(BUILDDIR)/s_demo.elf
+	$(TARGET) $(BUILDDIR)/s_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

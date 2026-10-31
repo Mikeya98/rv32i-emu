@@ -48,10 +48,12 @@
 - [x] 知乎第 3 篇撰写完毕: 寄存器文件 + addi（待发布）
 
 ### Phase 3: 控制流 + 特权 (第 6 篇)
-- [ ] 分支/跳转实现 (PC 修改)
-- [ ] CSR 读写指令
-- [ ] ecall 处理 (exit/mret)
-- [ ] 异常处理框架
+- [x] 分支/跳转实现 (PC 修改)
+- [x] CSR 读写指令
+- [x] ecall 处理 (exit/mret)
+- [x] 异常处理框架
+- [x] Sv32 分页 + U 态 (v0.4)
+- [x] S 态 + 异常委托 (v0.5, medeleg/mideleg/sret/SUM)
 
 ### Phase 4: 完整测试 (第 7 篇)
 - [ ] 用 riscv-gnu-toolchain 编译测试程序

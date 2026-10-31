@@ -48,7 +48,14 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc);
  */
 u32 trap_mret(emulator_t *emu);
 
+/**
+ * @brief sret: 从 S 态 trap handler 返回 (v0.5)
+ * @return 应该跳转到的 pc (sepc)
+ */
+u32 trap_sret(emulator_t *emu);
+
 /** 自测 */
 void trap_selftest(void);
+void trap_smode_selftest(void);
 
 #endif /* _RVEMU_TRAP_H */

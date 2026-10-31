@@ -58,8 +58,8 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.4                 │\n");
-    printf("│  RV32IM + trap + Sv32 + U-mode       │\n");
+    printf("│  RV32I Emulator v0.5                 │\n");
+    printf("│  RV32IM + trap + Sv32 + S/U-mode     │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
@@ -68,6 +68,7 @@ int main(int argc, char *argv[])
         decode_selftest();
         execute_selftest();
         trap_selftest();
+        trap_smode_selftest();
         mmu_selftest();
         emu_free(&emu);
         return 0;

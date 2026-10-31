@@ -333,12 +333,22 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
          * 加了 mret 之后 mret 会被误当成 ecall, 一路又陷回 handler。
          */
         if (inst->raw == 0x30200073) {
-            /* MRET: 从 trap handler 返回。U 态执行它属于非法指令 */
+            /* MRET: 从 M 态 trap handler 返回。S/U 态执行它属于非法指令 */
             if (emu->priv != PRIV_M) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
             next_pc = trap_mret(emu);
+        } else if (inst->raw == 0x10200073) {
+            /*
+             * SRET (v0.5): 从 S 态 trap handler 返回。
+             * S 和 M 都可以执行; U 态执行按非法指令处理。
+             */
+            if (emu->priv < PRIV_S) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
+            next_pc = trap_sret(emu);
         } else if ((inst->raw & 0xFE007FFFu) == 0x12000073u) {
             /*
              * SFENCE.VMA (v0.4): 刷 TLB。
@@ -347,23 +357,25 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 真正要做的事只有一件: 检查特权级。真实 CPU 上它是
              * M/S 态指令, U 态执行会陷非法指令。
              */
-            if (emu->priv != PRIV_M) {
+            if (emu->priv < PRIV_S) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
-        } else if (inst->funct3 == F3_ECALL) {
+        } else if (inst->raw == 0x00000073) {       /* ECALL */
             /*
              * v0.3: 如果程序装了 trap handler (mtvec != 0), ecall 就是
              * 一条纯异常的 ecall —— 进 handler, 由软件决定怎么处理。
              * 没装 handler 时保持 v0.2 的"宿主系统调用"约定 (exit/write),
              * 这样旧的 demo 不用改。
              */
-            if (emu->csr.mtvec != 0) {
+            if (emu->csr.mtvec != 0 || emu->csr.stvec != 0) {
                 /*
-                 * v0.4: ecall 的 mcause 取决于来源特权级
-                 *   M 态 → 11, U 态 → 8
+                 * v0.4/v0.5: ecall 的 cause 取决于来源特权级
+                 *   M 态 → 11, S 态 → 9, U 态 → 8
+                 * 如果 medeleg 对应位置 1, trap_raise 会把它转给 S 态。
                  */
-                u32 cause = (emu->priv == PRIV_M) ? EXC_ECALL_M : EXC_ECALL_U;
+                u32 cause = (emu->priv == PRIV_M) ? EXC_ECALL_M
+                          : (emu->priv == PRIV_S) ? EXC_ECALL_S : EXC_ECALL_U;
                 if (!trap_raise(emu, cause, 0, pc)) {
                     emu->state = EMU_EXCEPTION;
                     return false;
@@ -424,7 +436,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 emu->state = EMU_EXCEPTION;
                 break;
             }
-        } else if (inst->funct3 == F3_EBREAK) {
+        } else if (inst->raw == 0x00100073) {       /* EBREAK */
             if (emu->csr.mtvec != 0) {
                 if (!trap_raise(emu, EXC_BREAKPOINT, 0, pc)) {
                     emu->state = EMU_EXCEPTION;
@@ -441,11 +453,18 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             u32 csr_val, wdata;
 
             /*
-             * v0.4: 本模拟器实现的 CSR 全部是 M 态寄存器,
-             * U 态访问一律按非法指令处理 (真实 CPU 也是这个行为,
-             * 除非该 CSR 在规范里本身就是非特权寄存器)。
+             * v0.5: 按 CSR 地址里的最低特权级判断, 不再一刀切要求 M。
+             *   0x100 sstatus → S; 0x300 mstatus → M; 0x180 satp → S。
+             * U 态访问 sstatus 仍然非法; S 态访问 mstatus 也非法。
              */
-            if (emu->priv != PRIV_M) {
+            if (!csr_priv_ok(emu->priv, csr_addr)) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
+            if (!csr_writable(csr_addr) &&
+                (inst->funct3 == F3_CSRRW || inst->funct3 == F3_CSRRWI ||
+                 rs1_val != 0)) {
+                /* 只读 CSR: 写操作 (包括 rs1 != 0 的 set/clear) 非法 */
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }

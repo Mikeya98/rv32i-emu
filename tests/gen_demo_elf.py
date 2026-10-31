@@ -209,6 +209,14 @@ class Assembler:
                 out += struct.pack("<I", 0x30200073)
                 addr += 4
 
+            elif mn == "sret":
+                out += struct.pack("<I", 0x10200073)
+                addr += 4
+
+            elif mn == "ebreak":
+                out += struct.pack("<I", 0x00100073)
+                addr += 4
+
             elif mn in ("csrrw", "csrrs", "csrrc"):
                 rd, csr, rs1 = args
                 f3 = {"csrrw": 1, "csrrs": 2, "csrrc": 3}[mn]

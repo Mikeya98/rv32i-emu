@@ -35,14 +35,26 @@ static int fault_cause(access_t acc)
  * @brief  检查一个叶子 PTE 是否允许这次访问
  * @return true = 允许
  */
-static bool pte_allows(u32 pte, access_t acc, u32 priv)
+static bool pte_allows(emulator_t *emu, u32 pte, access_t acc)
 {
+    u32 priv = emu->priv;
+
     /* 叶子项至少要有 R 或 X; W=1 而 R=0 是保留编码 */
     if ((pte & (PTE_R | PTE_X)) == 0) return false;
     if ((pte & PTE_W) && !(pte & PTE_R)) return false;
 
     /* U 态只能访问 PTE.U = 1 的页; M 态不做翻译, 走不到这里 */
     if (priv == PRIV_U && !(pte & PTE_U)) return false;
+
+    /*
+     * S 态 (v0.5): 默认只能访问 S 页 (PTE.U = 0)。
+     * 打开 sstatus.SUM 后可以读写 U 页, 但仍然不能从 U 页取指 ——
+     * 这条限制防止 S 态把控制流跳进用户代码。
+     */
+    if (priv == PRIV_S && (pte & PTE_U)) {
+        if (acc == ACC_FETCH) return false;
+        if (!(emu->csr.mstatus & MSTATUS_SUM)) return false;
+    }
 
     switch (acc) {
     case ACC_FETCH:
@@ -113,7 +125,7 @@ int mmu_translate(emulator_t *emu, u32 va, access_t acc, u32 *pa)
         if (((pte >> PTE_PPN_SHIFT) & 0x3FFu) != 0) {
             return fault_cause(acc);        /* 大页 PPN[0] 非 0, 属于未对齐大页 */
         }
-        if (!pte_allows(pte, acc, emu->priv)) {
+        if (!pte_allows(emu, pte, acc)) {
             return fault_cause(acc);
         }
         pte_update_ad(emu, pte_addr, pte, acc);
@@ -134,7 +146,7 @@ int mmu_translate(emulator_t *emu, u32 va, access_t acc, u32 *pa)
     if ((pte & (PTE_R | PTE_X)) == 0) {
         return fault_cause(acc);            /* 二级表里不允许再有指针 */
     }
-    if (!pte_allows(pte, acc, emu->priv)) {
+    if (!pte_allows(emu, pte, acc)) {
         return fault_cause(acc);
     }
 
@@ -302,6 +314,38 @@ void mmu_selftest(void)
         MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == EXC_LOAD_PAGE_FAULT,
                   "PTE.U = 0 → U-mode load fault");
         memory_write32(&emu.mem, T_L2B + 0 * 4u, pte);
+    }
+
+    /* ---------- 6.5 S 态与 SUM (v0.5) ---------- */
+    printf("\n── S-mode access to U pages ──\n");
+    {
+        emu.priv = PRIV_S;
+        emu.csr.mstatus &= ~MSTATUS_SUM;
+        MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == EXC_LOAD_PAGE_FAULT,
+                  "S load of U page without SUM → fault");
+        MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_STORE, &pa) == EXC_STORE_PAGE_FAULT,
+                  "S store of U page without SUM → fault");
+
+        emu.csr.mstatus |= MSTATUS_SUM;
+        MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == 0 &&
+                  pa == T_DATA, "SUM=1: S load of U page allowed");
+        MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_STORE, &pa) == 0,
+                  "SUM=1: S store of U page allowed");
+        MMU_CHECK(mmu_translate(&emu, VA_CODE, ACC_FETCH, &pa) == EXC_INST_PAGE_FAULT,
+                  "SUM never allows S to fetch U page");
+
+        /* S 页 (PTE.U = 0) 不需要 SUM: 临时把代码页 U 位清掉 */
+        {
+            u32 pte;
+            memory_read32(&emu.mem, T_L2 + 0x10 * 4u, &pte);
+            memory_write32(&emu.mem, T_L2 + 0x10 * 4u, pte & ~PTE_U);
+            emu.csr.mstatus &= ~MSTATUS_SUM;
+            MMU_CHECK(mmu_translate(&emu, VA_CODE, ACC_FETCH, &pa) == 0,
+                      "S fetches S page without SUM");
+            memory_write32(&emu.mem, T_L2 + 0x10 * 4u, pte);
+        }
+
+        emu.priv = PRIV_U;          /* 后面的用例恢复 U 态前提 */
     }
 
     /* ---------- 7. 未映射地址 ---------- */
