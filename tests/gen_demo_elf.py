@@ -63,6 +63,10 @@ def b_type(imm, rs2, rs1, f3, op=0x63):
            (((imm >> 11) & 1) << 7) | (op & 0x7F)
 
 
+def amo_type(f5, rs2, rs1, rd):
+    return ((f5 & 0x1F) << 27) | ((reg(rs2) & 0x1F) << 20) |            ((reg(rs1) & 0x1F) << 15) | (2 << 12) |            ((reg(rd) & 0x1F) << 7) | 0x2F
+
+
 def u_type(imm20, rd, op):
     return ((imm20 & 0xFFFFF) << 12) | ((reg(rd) & 0x1F) << 7) | (op & 0x7F)
 
@@ -265,6 +269,27 @@ class Assembler:
                 label, = args
                 off = labels[label] - addr
                 out += struct.pack("<I", j_type(off, 0))
+                addr += 4
+
+            elif mn == "lr.w":
+                rd, rs1 = args
+                out += struct.pack("<I", amo_type(0x02, 0, rs1, rd))
+                addr += 4
+
+            elif mn == "sc.w":
+                rd, rs2, rs1 = args
+                out += struct.pack("<I", amo_type(0x03, rs2, rs1, rd))
+                addr += 4
+
+            elif mn in ("amoadd.w", "amoswap.w", "amoxor.w", "amoor.w",
+                        "amoand.w", "amomin.w", "amomax.w", "amominu.w",
+                        "amomaxu.w"):
+                f5 = {"amoadd.w": 0x00, "amoswap.w": 0x01, "amoxor.w": 0x04,
+                      "amoor.w": 0x08, "amoand.w": 0x0C, "amomin.w": 0x10,
+                      "amomax.w": 0x14, "amominu.w": 0x18,
+                      "amomaxu.w": 0x1C}[mn]
+                rd, rs2, rs1 = args
+                out += struct.pack("<I", amo_type(f5, rs2, rs1, rd))
                 addr += 4
 
             elif mn == "ecall":

@@ -1,10 +1,10 @@
-# RV32IM Emulator — 纯 C 手写 RISC-V CPU 模拟器
+# RV32IMA Emulator — 纯 C 手写 RISC-V CPU 模拟器
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![ISA](https://img.shields.io/badge/ISA-RV32IM-brightgreen.svg)](https://riscv.org/)
+[![ISA](https://img.shields.io/badge/ISA-RV32IMA-brightgreen.svg)](https://riscv.org/)
 [![Language](https://img.shields.io/badge/language-C11-orange.svg)]()
 
-一个从零手写的 **RISC-V RV32IM 指令集模拟器**，纯 C 实现，零依赖。
+一个从零手写的 **RISC-V RV32IMA 指令集模拟器**，纯 C 实现，零依赖。
 
 **不需要开发板，也不需要交叉编译工具链。** `make && make demo` 就能跑起来；仓库里的 `tests/gen_demo_elf.py` 用 Python 手写了一个小汇编器，直接生成可加载的 ELF。
 
@@ -12,6 +12,7 @@
 
 - **RV32I 基础整数指令集** — 40 条指令：ALU、load/store、分支跳转、LUI/AUIPC、CSR
 - **RV32M 乘除法** — mul/mulh/mulhsu/mulhu/div/divu/rem/remu，含除零和溢出语义
+- **RV32A 原子指令** — lr.w / sc.w / amoswap / amoadd / amoxor / amoand / amoor / amomin / amomax / amominu / amomaxu；单 hart 用 (valid, addr) 保留集实现 LR/SC，任何命中地址的写都会让 SC 失败
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
 - **系统调用** — `ecall` 按 a7 分发（exit / write），接近 RISC-V Linux ABI
@@ -22,7 +23,7 @@
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 45 项 + 执行 43 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，`make test` 全过
+- **自测** — 解码 49 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，`make test` 全过
 
 ## 快速开始
 
@@ -46,6 +47,9 @@ make sv32-demo
 
 # S 态 demo：U 态 ecall 委托给 S 态 handler → sret 返回
 make s-demo
+
+# RV32A demo：LR/SC 成功/失败 + AMOADD/AMOMAXU
+make atomic-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -99,7 +103,7 @@ breakpoint 0 set at 0x00010034
 main.c → emu.c (fetch→decode→execute)
            ├── elf.c       ELF 解析器
            ├── decode.c    指令解码 + 反汇编
-           ├── execute.c   执行引擎 (RV32I + RV32M + ecall)
+           ├── execute.c   执行引擎 (RV32I + RV32M + RV32A + ecall)
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
            ├── mmu.c       Sv32 分页 (页表遍历 / 权限 / A-D 位)
@@ -155,6 +159,19 @@ S8U
 - `8` — `scause` 是 8（ecall from U），说明委托生效
 - `U` — `sret` 正常回到 U 态，下一条指令继续执行
 
+`tests/gen_atomic_demo.py` 演示 RV32A。先在数据页写 5，`lr.w` 建立保留集，`sc.w` 写入 7 成功；再用普通 `sw` 打断保留集，第二次 `sc.w` 必须返回 1；最后用 `amoadd.w` 和 `amomaxu.w` 验证读-改-写和旧值返回：
+
+```
+$ make atomic-demo
+SRAM
+[SYSTEM] exit(0)
+```
+
+- `S` — LR/SC 成功
+- `R` — 普通 store 打断保留集，SC 失败
+- `A` — `amoadd.w` 返回旧值 9，mem 变成 16
+- `M` — `amomaxu.w` 返回旧值 16（max(16, 7) = 16）
+
 ## 进度
 
 | 模块 | 状态 |
@@ -173,6 +190,7 @@ S8U
 | Sv32 分页 (4KB 页 / 4MB 大页 / 权限 / A-D) | ✅ |
 | U 态 + 特权级切换 (MPP / mret / 特权指令陷入) | ✅ |
 | S 态 + 异常委托 (medeleg / mideleg / stvec / sret / SUM) | ✅ |
+| RV32A 原子指令 (LR/SC + 11 条 AMO) | ✅ |
 
 ## License
 

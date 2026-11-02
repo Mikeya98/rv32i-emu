@@ -277,6 +277,14 @@ void decode_selftest(void)
     /* mret → f3=0 imm=0x302 */
     TEST_FULL("mret",               0x30200073,  FMT_I, OP_SYSTEM, 0x302);
 
+    /* ==================== RV32A ==================== */
+    printf("\n── RV32A (atomic) ──\n\n");
+
+    TEST_FULL("lr.w x3, (x1)",       0x1000A1AF, FMT_R, OP_AMO, 0);
+    TEST_FULL("sc.w x4, x2, (x1)",   0x1820A22F, FMT_R, OP_AMO, 0);
+    TEST_FULL("amoadd.w x9, x2, (x1)", 0x0020A4AF, FMT_R, OP_AMO, 0);
+    TEST_FULL("amomaxu.w x10, x2, (x1)", 0xE020A52F, FMT_R, OP_AMO, 0);
+
     /* ==================== 边界测试 ==================== */
     printf("\n── Edge cases ──\n\n");
 

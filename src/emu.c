@@ -24,6 +24,9 @@ void emu_init(emulator_t *emu, u32 mem_size)
 
     emu->priv = PRIV_M;         /* 复位进 M 态 */
 
+    emu->reservation_valid = 0; /* RV32A: 复位后没有 LR 保留 */
+    emu->reservation_addr  = 0;
+
     emu->state     = EMU_HALTED;
     emu->entry     = 0;
     emu->exit_code = 0;

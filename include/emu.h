@@ -38,6 +38,11 @@ typedef struct {
      */
     u32         priv;
 
+    /* RV32A: LR/SC 保留集。单 hart 模拟器只需要记录一个地址,
+     * 任何针对该地址的写 (普通 store / AMO / SC) 都会让它失效。 */
+    u32         reservation_valid;
+    u32         reservation_addr;
+
     emu_state_t state;
     u32         entry;         /* ELF 入口地址 */
     u32         exit_code;     /* ecall 退出码 */

@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo
 
 all: $(TARGET)
 
@@ -50,6 +50,12 @@ s-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_s_demo.py $(BUILDDIR)/s_demo.elf
 	$(TARGET) $(BUILDDIR)/s_demo.elf
+
+# RV32A 原子指令 demo: LR/SC 成功/失败 + AMOADD/AMOMAXU
+atomic-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_atomic_demo.py $(BUILDDIR)/atomic_demo.elf
+	$(TARGET) $(BUILDDIR)/atomic_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

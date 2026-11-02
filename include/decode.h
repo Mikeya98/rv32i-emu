@@ -34,6 +34,7 @@ typedef enum {
     OP_ALUI     = 0x13,   /* 0010011 */
     OP_ALU      = 0x33,   /* 0110011 */
     OP_FENCE    = 0x0F,   /* 0001111 */
+    OP_AMO      = 0x2F,   /* 0101111  RV32A 原子指令 */
     OP_SYSTEM   = 0x73,   /* 1110011 */
 } opcode_t;
 

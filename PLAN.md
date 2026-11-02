@@ -54,6 +54,7 @@
 - [x] 异常处理框架
 - [x] Sv32 分页 + U 态 (v0.4)
 - [x] S 态 + 异常委托 (v0.5, medeleg/mideleg/sret/SUM)
+- [x] RV32A 原子指令 (v0.6, lr.w/sc.w + 11 条 AMO, 保留集语义)
 
 ### Phase 4: 完整测试 (第 7 篇)
 - [ ] 用 riscv-gnu-toolchain 编译测试程序
@@ -71,6 +72,8 @@
 | 5 | 分支和跳转：if/for/while 在 CPU 眼里是什么 | Phase 2 | 执行流程追踪图 |
 | 6 | 特权架构：CSR、异常、ecall——操作系统的基础 | Phase 3 | 异常处理流程图 |
 | 7 | 跑通一个真实程序 + 系列总结 | Phase 4 | 终端运行截图 |
+
+> 7 篇完成后继续扩展：v0.2 乘除法/调试器、v0.3 trap 框架、v0.4 Sv32/U 态、v0.5 S 态与异常委托、v0.6 RV32A 原子指令，对应 `zhihu/rv/08-12`。
 
 ## 流量策略
 

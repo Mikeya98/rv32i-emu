@@ -282,7 +282,115 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             fault_cause = EXC_STORE_ACCESS;
             goto except;
         }
+        /* 普通 store 命中 LR 保留地址 → 保留失效 */
+        if (emu->reservation_valid && emu->reservation_addr == pa) {
+            emu->reservation_valid = 0;
+        }
         break;
+
+    /* ===================== RV32A 原子指令 =====================
+     *
+     * 编码: funct5[31:27] | rs2 | rs1 | funct3=010(.W) | rd | 0101111
+     *   LR.W   funct5=00010  读并建立保留集
+     *   SC.W   funct5=00011  保留集有效时写入, rd=0 成功 / rd=1 失败
+     *   AMO*.W funct5=其余   读-改-写, rd=旧值
+     *
+     * 单 hart 模拟器用一个 (valid, addr) 表示保留集; 任何命中该地址的
+     * store / AMO / SC 都会让它失效。这已经能覆盖 LR/SC 的语义:
+     * 中间被别的写打断, SC 就必须失败。
+     */
+    case OP_AMO:
+    {
+        u8 f5 = (u8)(inst->funct7 >> 2);
+        u32 newval;
+
+        if (inst->funct3 != 2) {        /* 只实现 .W */
+            goto unknown;
+        }
+
+        addr = rs1_val;
+        if (addr & 3u) {
+            fault_cause = (f5 == 0x02) ? EXC_LOAD_MISALIGNED
+                                       : EXC_STORE_MISALIGNED;
+            goto except;
+        }
+
+        /* LR.W: 读 + 建立保留 */
+        if (f5 == 0x02) {
+            xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (!memory_read32(&emu->mem, pa, &b32)) {
+                fault_cause = EXC_LOAD_ACCESS;
+                goto except;
+            }
+            emu->reservation_valid = 1;
+            emu->reservation_addr  = pa;
+            reg_write(&emu->rf, inst->rd, b32);
+            break;
+        }
+
+        /* SC.W: 保留有效才写 */
+        if (f5 == 0x03) {
+            xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (emu->reservation_valid && emu->reservation_addr == pa) {
+                if (!memory_write32(&emu->mem, pa, rs2_val)) {
+                    fault_cause = EXC_STORE_ACCESS;
+                    goto except;
+                }
+                reg_write(&emu->rf, inst->rd, 0);
+            } else {
+                reg_write(&emu->rf, inst->rd, 1);
+            }
+            emu->reservation_valid = 0;
+            break;
+        }
+
+        /* AMO*.W: 读-改-写 */
+        xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+        if (xrc != 0) {
+            fault_cause = xrc;
+            goto except;
+        }
+        if (!memory_read32(&emu->mem, pa, &b32)) {
+            fault_cause = EXC_STORE_ACCESS;
+            goto except;
+        }
+
+        switch (f5) {
+        case 0x00: newval = b32 + rs2_val; break;                       /* amoadd  */
+        case 0x01: newval = rs2_val; break;                             /* amoswap */
+        case 0x04: newval = b32 ^ rs2_val; break;                       /* amoxor  */
+        case 0x08: newval = b32 | rs2_val; break;                       /* amoor   */
+        case 0x0C: newval = b32 & rs2_val; break;                       /* amoand  */
+        case 0x10: newval = ((s32)b32 < (s32)rs2_val) ? b32 : rs2_val;  /* amomin  */
+                   break;
+        case 0x14: newval = ((s32)b32 > (s32)rs2_val) ? b32 : rs2_val;  /* amomax  */
+                   break;
+        case 0x18: newval = (b32 < rs2_val) ? b32 : rs2_val;            /* amominu */
+                   break;
+        case 0x1C: newval = (b32 > rs2_val) ? b32 : rs2_val;            /* amomaxu */
+                   break;
+        default:
+            goto unknown;
+        }
+
+        if (!memory_write32(&emu->mem, pa, newval)) {
+            fault_cause = EXC_STORE_ACCESS;
+            goto except;
+        }
+        reg_write(&emu->rf, inst->rd, b32);
+        if (emu->reservation_valid && emu->reservation_addr == pa) {
+            emu->reservation_valid = 0;
+        }
+        break;
+    }
 
     /* ===================== BRANCH ===================== */
     case OP_BRANCH:
@@ -871,6 +979,47 @@ void execute_selftest(void)
     val = reg_read(&emu.rf, 16);  CHECK(val == 0xFFFFFFFF, "mulh  -7*3 high = -1");
     val = reg_read(&emu.rf, 14);  CHECK(val == 0xFFFFFFFF, "div   7/0 = -1");
     val = reg_read(&emu.rf, 15);  CHECK(val == 7,          "rem   7%0 = 7");
+    emu_free(&emu);
+
+    /* ==================== RV32A (LR/SC + AMO) ==================== */
+    printf("── RV32A (lr/sc + amo) ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu.state = EMU_RUNNING;
+
+    mem_write_inst(&emu.mem, base + 0,  0x10000093);  /* addi x1, x0, 0x100 */
+    mem_write_inst(&emu.mem, base + 4,  0x00500113);  /* addi x2, x0, 5 */
+    mem_write_inst(&emu.mem, base + 8,  0x00208023);  /* sw   x2, 0(x1) */
+    mem_write_inst(&emu.mem, base + 12, 0x1000A1AF);  /* lr.w x3, (x1) */
+    mem_write_inst(&emu.mem, base + 16, 0x00700113);  /* addi x2, x0, 7 */
+    mem_write_inst(&emu.mem, base + 20, 0x1820A22F);  /* sc.w x4, x2, (x1) */
+    mem_write_inst(&emu.mem, base + 24, 0x0000A283);  /* lw   x5, 0(x1) */
+    mem_write_inst(&emu.mem, base + 28, 0x1000A32F);  /* lr.w x6, (x1) */
+    mem_write_inst(&emu.mem, base + 32, 0x00900393);  /* addi x7, x0, 9 */
+    mem_write_inst(&emu.mem, base + 36, 0x0070A023);  /* sw   x7, 0(x1) */
+    mem_write_inst(&emu.mem, base + 40, 0x1820A42F);  /* sc.w x8, x2, (x1) */
+    mem_write_inst(&emu.mem, base + 44, 0x0020A4AF);  /* amoadd.w   x9,  x2, (x1) */
+    mem_write_inst(&emu.mem, base + 48, 0xA020A52F);  /* amomax.w   x10, x2, (x1) */
+    mem_write_inst(&emu.mem, base + 52, 0xC020A5AF);  /* amominu.w  x11, x2, (x1) */
+    mem_write_inst(&emu.mem, base + 56, 0x0000A603);  /* lw   x12, 0(x1) */
+    mem_write_inst(&emu.mem, base + 60, 0x00000073);  /* ecall */
+
+    emu.rf.pc = base;
+    emu_run(&emu, 16);
+
+    val = reg_read(&emu.rf, 3);   CHECK(val == 5,  "lr.w  x3 = 5");
+    val = reg_read(&emu.rf, 4);   CHECK(val == 0,  "sc.w  x4 = 0 (success)");
+    val = reg_read(&emu.rf, 5);   CHECK(val == 7,  "lw    x5 = 7 (sc wrote)");
+    val = reg_read(&emu.rf, 6);   CHECK(val == 7,  "lr.w  x6 = 7");
+    val = reg_read(&emu.rf, 8);   CHECK(val == 1,  "sc.w  x8 = 1 (store broke reservation)");
+    val = reg_read(&emu.rf, 9);   CHECK(val == 9,  "amoadd.w  x9 = 9 (old value)");
+    val = reg_read(&emu.rf, 10);  CHECK(val == 16, "amomax.w  x10 = 16 (old value)");
+    val = reg_read(&emu.rf, 11);  CHECK(val == 16, "amominu.w x11 = 16 (old value)");
+    val = reg_read(&emu.rf, 12);  CHECK(val == 7,  "lw    x12 = 7 (min(16,7))");
+    {
+        u32 mem_val;
+        memory_read32(&emu.mem, 0x100, &mem_val);
+        CHECK(mem_val == 7, "mem[0x100] = 7");
+    }
     emu_free(&emu);
 
     /* ==================== 结果汇总 ==================== */

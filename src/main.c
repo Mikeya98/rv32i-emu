@@ -58,8 +58,8 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.5                 │\n");
-    printf("│  RV32IM + trap + Sv32 + S/U-mode     │\n");
+    printf("│  RV32I Emulator v0.6                 │\n");
+    printf("│  RV32IMA + trap + Sv32 + S/U-mode     │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);

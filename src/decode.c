@@ -79,6 +79,7 @@ static inst_fmt_t get_fmt(opcode_t op)
     case OP_LOAD:   return FMT_I;
     case OP_JALR:   return FMT_I;
     case OP_STORE:  return FMT_S;
+    case OP_AMO:    return FMT_R;
     case OP_BRANCH: return FMT_B;
     case OP_LUI:    return FMT_U;
     case OP_AUIPC:  return FMT_U;
@@ -176,6 +177,25 @@ static const char *store_name(u8 f3)
 {
     static const char *const n[8] = { "sb", "sh", "sw", NULL, NULL, NULL, NULL, NULL };
     return (f3 < 8) ? n[f3] : NULL;
+}
+
+/* RV32A: funct5 在 [31:27] (decoded 里是 funct7 >> 2) */
+static const char *amo_name(u8 f5)
+{
+    switch (f5) {
+    case 0x02: return "lr.w";
+    case 0x03: return "sc.w";
+    case 0x00: return "amoadd.w";
+    case 0x01: return "amoswap.w";
+    case 0x04: return "amoxor.w";
+    case 0x08: return "amoor.w";
+    case 0x0C: return "amoand.w";
+    case 0x10: return "amomin.w";
+    case 0x14: return "amomax.w";
+    case 0x18: return "amominu.w";
+    case 0x1C: return "amomaxu.w";
+    default:   return NULL;
+    }
 }
 
 static const char *branch_name(u8 f3)
@@ -291,6 +311,19 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
     case OP_FENCE:
         snprintf(buf, buf_size, "fence");
         break;
+
+    case OP_AMO: {
+        const char *n = amo_name(inst->funct7 >> 2);
+        if (n && inst->funct3 == 2) {
+            if ((inst->funct7 >> 2) == 0x02) {
+                snprintf(buf, buf_size, "%s %s, (%s)", n, rn(inst->rd), rn(inst->rs1));
+            } else {
+                snprintf(buf, buf_size, "%s %s, %s, (%s)", n,
+                         rn(inst->rd), rn(inst->rs2), rn(inst->rs1));
+            }
+        }
+        break;
+    }
 
     default:
         break;
