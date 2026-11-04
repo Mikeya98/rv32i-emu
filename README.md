@@ -17,7 +17,7 @@
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
 - **系统调用** — `ecall` 按 a7 分发（exit / write），接近 RISC-V Linux ABI
-- **交互式调试器** — 单步、继续、断点、寄存器、内存、反汇编
+- **交互式调试器** — 单步、继续、断点、寄存器、内存、反汇编；能识别 16 位压缩指令，反汇编时标 `[c]` 并按 2 字节步进
 - **CSR** — mstatus/mie/mtvec/mscratch/mepc/mcause/mtval/mip/mcycle
 - **trap 框架** — 异常（ecall / 非法指令 / 访存错误 / 非对齐）和中断（机器定时器）统一进入 mtvec，`mret` 返回
 - **Sv32 分页** — 两级页表（4KB 页 + 4MB 大页）、satp、PTE 权限位（V/R/W/X/U/A/D）、取指/读/写三类缺页（mcause 12/13/15）

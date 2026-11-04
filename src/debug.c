@@ -99,23 +99,64 @@ static void bp_list(void)
 
 /* =========================== 单条指令显示 =========================== */
 
-static void show_inst(emulator_t *emu, u32 addr)
+/*
+ * 取一条指令并解码。RV32C 的 16 位指令先展开成 32 位，
+ * 和 emu_step 的处理保持一致。
+ *
+ * 返回: 0 = 成功, -1 = 读内存失败, -2 = 非法指令
+ */
+static int fetch_decoded(emulator_t *emu, u32 addr,
+                         decoded_inst_t *inst, u32 *raw_out, bool *compressed)
 {
+    u16 lo;
     u32 raw;
-    decoded_inst_t inst;
-    char buf[128];
+
+    if (!memory_read16(&emu->mem, addr, &lo)) {
+        return -1;
+    }
+
+    if ((lo & 3u) != 3u) {
+        if (!expand_compressed(lo, &raw) || !decode(raw, inst)) {
+            *raw_out = lo;
+            return -2;
+        }
+        inst->len = 2;
+        *raw_out = lo;
+        if (compressed) *compressed = true;
+        return 0;
+    }
 
     if (!memory_read32(&emu->mem, addr, &raw)) {
+        return -1;
+    }
+    if (!decode(raw, inst)) {
+        *raw_out = raw;
+        return -2;
+    }
+    *raw_out = raw;
+    if (compressed) *compressed = false;
+    return 0;
+}
+
+static void show_inst(emulator_t *emu, u32 addr)
+{
+    u32 raw = 0;
+    decoded_inst_t inst;
+    char buf[128];
+    bool compressed = false;
+    int rc = fetch_decoded(emu, addr, &inst, &raw, &compressed);
+
+    if (rc == -1) {
         printf("  0x%08X: <unmapped>\n", addr);
         return;
     }
-    if (!decode(raw, &inst)) {
+    if (rc == -2) {
         printf("  0x%08X: .word 0x%08X\n", addr, raw);
         return;
     }
 
     decode_disasm(&inst, buf, sizeof(buf));
-    printf("  0x%08X: %s\n", addr, buf);
+    printf("  0x%08X: %s%s\n", addr, compressed ? "[c] " : "", buf);
 }
 
 static const char *state_name(emu_state_t s)
@@ -215,21 +256,24 @@ static void cmd_disasm(emulator_t *emu, u32 addr, u32 n)
     u32 i;
 
     for (i = 0; i < n; i++) {
-        u32 raw;
+        u32 raw = 0;
         decoded_inst_t inst;
         char buf[128];
+        bool compressed = false;
+        int rc = fetch_decoded(emu, addr, &inst, &raw, &compressed);
 
-        if (!memory_read32(&emu->mem, addr, &raw)) {
+        if (rc == -1) {
             printf("  0x%08X: <unmapped>\n", addr);
             return;
         }
-        if (!decode(raw, &inst)) {
+        if (rc == -2) {
             printf("  0x%08X: .word 0x%08X\n", addr, raw);
+            addr += ((raw & 3u) != 3u) ? 2u : 4u;
         } else {
             decode_disasm(&inst, buf, sizeof(buf));
-            printf("  0x%08X: %s\n", addr, buf);
+            printf("  0x%08X: %s%s\n", addr, compressed ? "[c] " : "", buf);
+            addr += inst.len;
         }
-        addr += 4;
     }
 }
 
