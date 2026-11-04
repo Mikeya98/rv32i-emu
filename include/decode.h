@@ -57,7 +57,8 @@ typedef enum {
 
 /* =========================== 解码后的指令 =========================== */
 typedef struct {
-    u32         raw;       /* 原始 32-bit 指令 */
+    u32         raw;       /* 原始 32-bit 指令 (压缩指令是展开后的等价指令) */
+    u8          len;       /* 指令长度: 4 = 32-bit, 2 = 压缩 (RV32C) */
     inst_fmt_t  fmt;       /* 指令格式 */
     opcode_t    opcode;    /* 操作码 (7-bit) */
     u8          rd;        /* 目标寄存器 (5-bit) */
@@ -78,8 +79,23 @@ typedef struct {
  */
 bool decode(u32 raw, decoded_inst_t *inst);
 
+/**
+ * @brief  把一条 16-bit 压缩指令 (RV32C) 展开成等价的 32-bit 指令
+ *
+ * 模拟器不单独实现一套压缩指令执行器, 而是先展开再走原有的
+ * decode → execute 路径。这样 ALU/访存/分支的语义只有一份。
+ *
+ * @param  c      16-bit 压缩指令
+ * @param  out32  输出: 等价的 32-bit 指令
+ * @return true=展开成功, false=保留/非法编码
+ */
+bool expand_compressed(u16 c, u32 *out32);
+
 /* 调试: 打印指令的反汇编 */
 void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size);
+
+/* 自测: RV32C 展开 + 执行 */
+void rvc_selftest(void);
 
 /* 自测: 覆盖全部 6 种指令格式 */
 void decode_selftest(void);

@@ -12,6 +12,10 @@
  */
 
 #include "decode.h"
+#include "emu.h"
+#include "execute.h"
+#include "memory.h"
+#include "regfile.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -309,5 +313,175 @@ void decode_selftest(void)
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║  Results: %2d passed, %2d failed                              ║\n",
            passed, failed);
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+}
+
+/* =========================== RV32C 自测 =========================== */
+
+static int rvc_passed = 0;
+static int rvc_failed = 0;
+
+#define RVC_EXPAND(name, c16, expect32)                                     \
+    do {                                                                    \
+        u32 got = 0;                                                        \
+        bool ok = expand_compressed((u16)(c16), &got);                      \
+        if (!ok) {                                                          \
+            printf("  [FAIL] %-22s 0x%04X: expand returned false\n",        \
+                   name, (u16)(c16));                                       \
+            rvc_failed++;                                                   \
+        } else if (got != (u32)(expect32)) {                                \
+            printf("  [FAIL] %-22s 0x%04X: got 0x%08X, want 0x%08X\n",      \
+                   name, (u16)(c16), got, (u32)(expect32));                 \
+            rvc_failed++;                                                   \
+        } else {                                                            \
+            rvc_passed++;                                                   \
+        }                                                                   \
+    } while (0)
+
+#define RVC_CHECK(cond, name)                                               \
+    do {                                                                    \
+        if (cond) {                                                         \
+            rvc_passed++;                                                   \
+        } else {                                                            \
+            printf("  [FAIL] %s\n", name);                                  \
+            rvc_failed++;                                                   \
+        }                                                                   \
+    } while (0)
+
+static void rvc_load(emulator_t *emu, u32 addr, const u16 *code, u32 n)
+{
+    u32 i;
+    for (i = 0; i < n; i++) {
+        memory_write16(&emu->mem, addr + i * 2u, code[i]);
+    }
+    emu->rf.pc = addr;
+    emu->state = EMU_RUNNING;
+}
+
+void rvc_selftest(void)
+{
+    emulator_t emu;
+    const u32 base = 0x1000;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        RV32C Compressed Instruction Self-Test            ║\n");
+    printf("║        16-bit → 32-bit expansion + execution             ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    /* ---------------- 展开: 算术 / 立即数 ---------------- */
+    printf("── Expansion: ALU / immediate ──\n");
+    RVC_EXPAND("c.li a0, 5",        0x4515, 0x00500513);
+    RVC_EXPAND("c.addi a0, a0, 1",  0x0505, 0x00150513);
+    RVC_EXPAND("c.slli a0, a0, 2",  0x050A, 0x00251513);
+    RVC_EXPAND("c.srli a0, a0, 1",  0x8105, 0x00155513);
+    RVC_EXPAND("c.andi a0, a0, -1", 0x997D, 0xFFF57513);
+    RVC_EXPAND("c.addi4spn x8, 4",  0x0040, 0x00410413);
+    RVC_EXPAND("c.addi16sp sp, 16", 0x6141, 0x01010113);
+    RVC_EXPAND("c.lui a1, 0x10",    0x65C1, 0x000105B7);
+
+    /* ---------------- 展开: 访存 ---------------- */
+    printf("\n── Expansion: load / store ──\n");
+    RVC_EXPAND("c.lw x9, 0(x8)",    0x4004, 0x00042483);
+    RVC_EXPAND("c.sw x9, 0(x8)",    0xC004, 0x00942023);
+    RVC_EXPAND("c.lwsp a0, 0(sp)",  0x4502, 0x00012503);
+    RVC_EXPAND("c.swsp a0, 0(sp)",  0xC02A, 0x00A12023);
+
+    /* ---------------- 展开: 控制流 ---------------- */
+    printf("\n── Expansion: control flow ──\n");
+    RVC_EXPAND("c.beqz x8, +6",     0xC019, 0x00040363);
+    RVC_EXPAND("c.bnez x8, +6",     0xE019, 0x00041363);
+    RVC_EXPAND("c.j +8",            0xA021, 0x0080006F);
+    RVC_EXPAND("c.jal +8",          0x2021, 0x008000EF);
+    RVC_EXPAND("c.jr a0",           0x8502, 0x00050067);
+    RVC_EXPAND("c.jalr a0",         0x9502, 0x000500E7);
+    RVC_EXPAND("c.mv a0, a1",       0x852E, 0x00B00533);
+    RVC_EXPAND("c.add a0, a1",      0x952E, 0x00B50533);
+    RVC_EXPAND("c.ebreak",          0x9002, 0x00100073);
+
+    /* ---------------- 执行: ALU 链 ---------------- */
+    printf("\n── Execution: ALU chain ──\n");
+    emu_init(&emu, MEM_SIZE);
+    {
+        /* c.li a0,5; c.addi a0,1; c.slli a0,2; c.ebreak */
+        const u16 code[] = { 0x4515, 0x0505, 0x050A, 0x9002 };
+        rvc_load(&emu, base, code, 4);
+        emu_run(&emu, 10);
+        RVC_CHECK(reg_read(&emu.rf, 10) == 24u, "a0 == (5+1)<<2 == 24");
+        RVC_CHECK(emu.state == EMU_HALTED, "ebreak halted");
+    }
+
+    /* ---------------- 执行: 压缩 load/store ---------------- */
+    printf("\n── Execution: compressed load/store ──\n");
+    emu_init(&emu, MEM_SIZE);
+    {
+        /* c.lui x8,0x11 → 0x11000; c.li x9,21; c.sw x9,0(x8);
+         * c.lw x10,0(x8); c.ebreak */
+        const u16 code[] = { 0x6445, 0x44D5, 0xC004, 0x4008, 0x9002 };
+        rvc_load(&emu, base, code, 5);
+        emu_run(&emu, 10);
+        RVC_CHECK(reg_read(&emu.rf, 10) == 21u, "c.lw loaded 21");  /* rd=x10 */
+        {
+            u32 v = 0;
+            memory_read32(&emu.mem, 0x11000u, &v);
+            RVC_CHECK(v == 21u, "c.sw stored 21 at 0x11000");
+        }
+    }
+
+    /* ---------------- 执行: 条件分支 ---------------- */
+    printf("\n── Execution: compressed branch ──\n");
+    emu_init(&emu, MEM_SIZE);
+    {
+        /* c.li a0,0; c.beqz a0,+6 → 0x1008; 两条被跳过; c.li a2,9; ebreak */
+        const u16 code[] = {
+            0x4501,             /* 0x1000: c.li a0, 0       */
+            0xC119,             /* 0x1002: c.beqz a0, +6    */
+            0x459D,             /* 0x1004: c.li a1, 7 (skip) */
+            0x45A1,             /* 0x1006: c.li a1, 8 (skip) */
+            0x4625,             /* 0x1008: c.li a2, 9       */
+            0x9002              /* 0x100A: c.ebreak         */
+        };
+        rvc_load(&emu, base, code, 6);
+        emu_run(&emu, 20);
+        RVC_CHECK(reg_read(&emu.rf, 11) == 0u, "branch taken, a1 untouched");
+        RVC_CHECK(reg_read(&emu.rf, 12) == 9u, "a2 == 9 after branch");
+    }
+
+    /* ---------------- 执行: 跳转与链接 ---------------- */
+    printf("\n── Execution: compressed jump / link ──\n");
+    emu_init(&emu, MEM_SIZE);
+    {
+        /* c.jal +4 at 0x1000 → 0x1004, ra = 0x1002 */
+        const u16 code[] = { 0x2011, 0x9002 };
+        rvc_load(&emu, base, code, 2);
+        emu_run(&emu, 5);
+        RVC_CHECK(reg_read(&emu.rf, 1) == 0x1002u, "c.jal links pc+2");
+    }
+
+    emu_init(&emu, MEM_SIZE);
+    {
+        /* c.lui a0,1 → 0x1000; c.addi a0,6 → 0x1006; c.jalr a0; ebreak */
+        const u16 code[] = { 0x6505, 0x0519, 0x9502, 0x9002 };
+        rvc_load(&emu, base, code, 4);
+        emu_run(&emu, 10);
+        RVC_CHECK(reg_read(&emu.rf, 1) == 0x1006u, "c.jalr links pc+2");
+    }
+
+    /* ---------------- 非法/保留编码 ---------------- */
+    printf("\n── Reserved encodings ──\n");
+    {
+        u32 out = 0;
+        RVC_CHECK(!expand_compressed(0x0000, &out), "0x0000 reserved");
+        RVC_CHECK(!expand_compressed(0x0004, &out), "c.addi4spn imm=0 reserved");
+        RVC_CHECK(!expand_compressed(0x6001, &out), "c.lui rd=0 reserved");
+        RVC_CHECK(!expand_compressed(0x2002, &out), "c.fldsp rejected (no D)");
+    }
+
+    emu_free(&emu);
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  RV32C Results: %2d passed, %2d failed                        ║\n",
+           rvc_passed, rvc_failed);
     printf("╚══════════════════════════════════════════════════════════╝\n");
 }

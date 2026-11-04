@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo
 
 all: $(TARGET)
 
@@ -56,6 +56,12 @@ atomic-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_atomic_demo.py $(BUILDDIR)/atomic_demo.elf
 	$(TARGET) $(BUILDDIR)/atomic_demo.elf
+
+# RV32C 压缩指令 demo: 16 位指令 + 一条 ecall
+rvc-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_compressed_demo.py $(BUILDDIR)/rvc_demo.elf
+	$(TARGET) $(BUILDDIR)/rvc_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

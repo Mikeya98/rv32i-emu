@@ -60,7 +60,8 @@ static u32 rv_remu(u32 a, u32 b)
 bool execute(emulator_t *emu, decoded_inst_t *inst)
 {
     u32 pc      = emu->rf.pc;
-    u32 next_pc = pc + 4;          /* 默认顺序执行 */
+    u32 ilen    = inst->len ? inst->len : 4u;   /* 压缩指令是 2 字节 */
+    u32 next_pc = pc + ilen;       /* 默认顺序执行 */
     u32 rs1_val = reg_read(&emu->rf, inst->rs1);
     u32 rs2_val = reg_read(&emu->rf, inst->rs2);
     u32 result  = 0;
@@ -406,19 +407,19 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         default:      goto unknown;
         }
         if (taken) next_pc = pc + inst->imm;  /* 跳转 */
-        /* 不跳转则 next_pc 保持 pc+4 */
+        /* 不跳转则 next_pc 保持 pc+ilen */
         break;
     }
 
     /* ===================== JAL ===================== */
     case OP_JAL:
-        reg_write(&emu->rf, inst->rd, pc + 4);   /* 链接 */
-        next_pc = pc + inst->imm;                 /* 跳转 */
+        reg_write(&emu->rf, inst->rd, pc + ilen);   /* 链接 */
+        next_pc = pc + inst->imm;                    /* 跳转 */
         break;
 
     /* ===================== JALR ===================== */
     case OP_JALR:
-        result  = pc + 4;
+        result  = pc + ilen;
         next_pc = (rs1_val + inst->imm) & ~1u;    /* 最低位清零 */
         reg_write(&emu->rf, inst->rd, result);     /* 链接 */
         break;

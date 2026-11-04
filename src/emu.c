@@ -76,6 +76,7 @@ u64 emu_run(emulator_t *emu, u64 max_steps)
 bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 {
     u32 raw;
+    bool compressed = false;
     u32 pc = emu->rf.pc;
 
     /*
@@ -89,8 +90,8 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         return true;            /* 这一"步"没有执行指令, 但跳进了 handler */
     }
 
-    /* 1. Fetch: 从内存取出 32-bit 指令 */
-    if ((pc & 3u) != 0) {
+    /* 1. Fetch: 取出 16-bit 或 32-bit 指令 (RV32C 允许 2 字节对齐) */
+    if ((pc & 1u) != 0) {
         if (trap_raise(emu, EXC_INST_MISALIGNED, pc, pc)) {
             emu->csr.mcycle++;
             return true;
@@ -107,6 +108,9 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
      */
     {
         u32 fetch_pa = 0;
+        u16 lo = 0;
+        u16 hi = 0;
+        bool fetch_ok = true;
         int frc = mmu_translate(emu, pc, ACC_FETCH, &fetch_pa);
 
         if (frc != 0) {
@@ -119,7 +123,11 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
             return false;
         }
 
-        if (!memory_read32(&emu->mem, fetch_pa, &raw)) {
+        /*
+         * 先读 16 位。低两位不是 11 就是压缩指令 (RV32C),
+         * 否则后面还跟着半个字。
+         */
+        if (!memory_read16(&emu->mem, fetch_pa, &lo)) {
             if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
                 emu->csr.mcycle++;
                 return true;
@@ -127,6 +135,46 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
             printf("[EMU] fetch failed at pc=0x%08X\n", pc);
             emu->state = EMU_EXCEPTION;
             return false;
+        }
+
+        if ((lo & 3u) != 3u) {
+            if (!expand_compressed(lo, &raw)) {
+                if (trap_raise(emu, EXC_ILLEGAL_INST, lo, pc)) {
+                    emu->csr.mcycle++;
+                    return true;
+                }
+                printf("[EMU] bad compressed inst 0x%04X at pc=0x%08X\n", lo, pc);
+                emu->state = EMU_EXCEPTION;
+                return false;
+            }
+            compressed = true;
+        } else {
+            /*
+             * 32-bit 指令。正常情况下在同一个物理页里直接读 32 位;
+             * 如果正好压在页尾 (只有 2 字节在本页), 把第二个半字
+             * 单独翻译一次, 避免跨页时读到相邻物理页的内容。
+             */
+            if ((fetch_pa & 0xFFFu) <= 0xFFCu) {
+                fetch_ok = memory_read32(&emu->mem, fetch_pa, &raw);
+            } else {
+                u32 pa2 = 0;
+                if (mmu_translate(emu, pc + 2u, ACC_FETCH, &pa2) != 0 ||
+                    !memory_read16(&emu->mem, pa2, &hi)) {
+                    fetch_ok = false;
+                } else {
+                    raw = (u32)lo | ((u32)hi << 16);
+                }
+            }
+
+            if (!fetch_ok) {
+                if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
+                    emu->csr.mcycle++;
+                    return true;
+                }
+                printf("[EMU] fetch failed at pc=0x%08X\n", pc);
+                emu->state = EMU_EXCEPTION;
+                return false;
+            }
         }
     }
 
@@ -139,6 +187,11 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         printf("[EMU] decode failed at pc=0x%08X raw=0x%08X\n", pc, raw);
         emu->state = EMU_EXCEPTION;
         return false;
+    }
+
+    /* decode() 默认 len=4, 压缩指令在这里改回 2 (影响 PC 增量和链接值) */
+    if (compressed) {
+        inst_out->len = 2;
     }
 
     /* 3. Execute (内部更新 pc 和 state) */

@@ -96,6 +96,7 @@ bool decode(u32 raw, decoded_inst_t *inst)
     opcode_t op = (opcode_t)OPCODE(raw);
 
     inst->raw    = raw;
+    inst->len    = 4;
     inst->opcode = op;
     inst->fmt    = get_fmt(op);
 
@@ -118,6 +119,311 @@ bool decode(u32 raw, decoded_inst_t *inst)
     }
 
     return true;
+}
+
+/* =========================== RV32C 展开 =========================== */
+
+/*
+ * 压缩指令不单独实现执行器, 而是展开成等价的 32-bit 指令, 再交给
+ * 原来的 decode/execute。好处是 ALU、访存、分支的语义只有一份。
+ *
+ * 编码器的参数顺序尽量贴近 RISC-V 手册, 便于对照。
+ */
+static u32 enc_r(u8 f7, u8 rs2, u8 rs1, u8 f3, u8 rd, u8 op)
+{
+    return ((u32)(f7 & 0x7F) << 25) | ((u32)(rs2 & 0x1F) << 20) |
+           ((u32)(rs1 & 0x1F) << 15) | ((u32)(f3 & 7) << 12) |
+           ((u32)(rd & 0x1F) << 7) | (op & 0x7F);
+}
+
+static u32 enc_i(s32 imm, u8 rs1, u8 f3, u8 rd, u8 op)
+{
+    return (((u32)imm & 0xFFFu) << 20) | ((u32)(rs1 & 0x1F) << 15) |
+           ((u32)(f3 & 7) << 12) | ((u32)(rd & 0x1F) << 7) | (op & 0x7F);
+}
+
+static u32 enc_s(s32 imm, u8 rs2, u8 rs1, u8 f3, u8 op)
+{
+    u32 u = (u32)imm;
+    return (((u >> 5) & 0x7F) << 25) | ((u32)(rs2 & 0x1F) << 20) |
+           ((u32)(rs1 & 0x1F) << 15) | ((u32)(f3 & 7) << 12) |
+           ((u & 0x1F) << 7) | (op & 0x7F);
+}
+
+static u32 enc_b(s32 imm, u8 rs2, u8 rs1, u8 f3, u8 op)
+{
+    u32 u = (u32)imm;
+    return (((u >> 12) & 1u) << 31) | (((u >> 5) & 0x3Fu) << 25) |
+           ((u32)(rs2 & 0x1F) << 20) | ((u32)(rs1 & 0x1F) << 15) |
+           ((u32)(f3 & 7) << 12) | (((u >> 1) & 0xFu) << 8) |
+           (((u >> 11) & 1u) << 7) | (op & 0x7F);
+}
+
+static u32 enc_u(s32 imm, u8 rd, u8 op)
+{
+    return ((u32)imm & 0xFFFFF000u) | ((u32)(rd & 0x1F) << 7) | (op & 0x7F);
+}
+
+static u32 enc_j(s32 imm, u8 rd, u8 op)
+{
+    u32 u = (u32)imm;
+    return (((u >> 20) & 1u) << 31) | (((u >> 1) & 0x3FFu) << 21) |
+           (((u >> 11) & 1u) << 20) | (((u >> 12) & 0xFFu) << 12) |
+           ((u32)(rd & 0x1F) << 7) | (op & 0x7F);
+}
+
+/* 压缩指令的立即数位域提取 */
+#define C_OP(c)     ((c) & 3u)
+#define C_F3(c)     (((c) >> 13) & 7u)
+#define C_RD(c)     (((c) >> 7) & 0x1Fu)
+#define C_RS2(c)    (((c) >> 2) & 0x1Fu)
+#define C_RS1P(c)   (8u + (((c) >> 7) & 7u))
+#define C_RDP(c)    (8u + (((c) >> 2) & 7u))
+#define C_RS2P(c)   (8u + (((c) >> 2) & 7u))
+
+/* CI 型立即数: imm[5]=bit12, imm[4:0]=bits[6:2] */
+static u32 c_imm6(u16 c)
+{
+    return (((c >> 12) & 1u) << 5) | ((c >> 2) & 0x1Fu);
+}
+
+static u32 c_uimm_addi4spn(u16 c)
+{
+    return (((c >> 11) & 3u) << 4) | (((c >> 7) & 0xFu) << 6) |
+           (((c >> 6) & 1u) << 2) | (((c >> 5) & 1u) << 3);
+}
+
+static u32 c_uimm_lw(u16 c)
+{
+    return (((c >> 10) & 7u) << 3) | (((c >> 6) & 1u) << 2) |
+           (((c >> 5) & 1u) << 6);
+}
+
+static u32 c_uimm_lwsp(u16 c)
+{
+    return (((c >> 12) & 1u) << 5) | (((c >> 4) & 7u) << 2) |
+           (((c >> 2) & 3u) << 6);
+}
+
+static u32 c_uimm_swsp(u16 c)
+{
+    return (((c >> 9) & 0xFu) << 2) | (((c >> 7) & 3u) << 6);
+}
+
+/* C.BEQZ/C.BNEZ: imm[8]=12, [4:3]=11:10, [7:6]=6:5, [2:1]=4:3, [5]=2 */
+static u32 c_imm_b(u16 c)
+{
+    return (((c >> 12) & 1u) << 8) | (((c >> 10) & 3u) << 3) |
+           (((c >> 5) & 3u) << 6) | (((c >> 3) & 3u) << 1) |
+           (((c >> 2) & 1u) << 5);
+}
+
+/* C.J/C.JAL: imm[11]=12, [4]=11, [9:8]=10:9, [10]=8,
+ *            [6]=7, [7]=6, [3:1]=5:3, [5]=2 */
+static u32 c_imm_j(u16 c)
+{
+    return (((c >> 12) & 1u) << 11) | (((c >> 11) & 1u) << 4) |
+           (((c >> 9) & 3u) << 8) | (((c >> 8) & 1u) << 10) |
+           (((c >> 7) & 1u) << 6) | (((c >> 6) & 1u) << 7) |
+           (((c >> 3) & 7u) << 1) | (((c >> 2) & 1u) << 5);
+}
+
+/* C.ADDI16SP: imm[9]=12, [4]=6, [6]=5, [8:7]=4:3, [5]=2 */
+static u32 c_imm_addi16sp(u16 c)
+{
+    return (((c >> 12) & 1u) << 9) | (((c >> 6) & 1u) << 4) |
+           (((c >> 5) & 1u) << 6) | (((c >> 3) & 3u) << 7) |
+           (((c >> 2) & 1u) << 5);
+}
+
+bool expand_compressed(u16 c, u32 *out32)
+{
+    u32 q = C_OP(c);
+    u32 f3 = C_F3(c);
+    u32 rd = C_RD(c);
+    u32 rs2 = C_RS2(c);
+    u32 imm;
+    s32 simm;
+
+    if (!out32) {
+        return false;
+    }
+
+    /* ======================= Quadrant 0 ======================= */
+    if (q == 0) {
+        switch (f3) {
+        case 0: /* C.ADDI4SPN: addi rd', sp, nzuimm */
+            imm = c_uimm_addi4spn(c);
+            if (imm == 0) return false;             /* 保留编码 */
+            *out32 = enc_i((s32)imm, 2, 0, C_RDP(c), 0x13);
+            return true;
+
+        case 2: /* C.LW: lw rd', uimm(rs1') */
+            imm = c_uimm_lw(c);
+            *out32 = enc_i((s32)imm, C_RS1P(c), 2, C_RDP(c), 0x03);
+            return true;
+
+        case 6: /* C.SW: sw rs2', uimm(rs1') */
+            imm = c_uimm_lw(c);
+            *out32 = enc_s((s32)imm, C_RS2P(c), C_RS1P(c), 2, 0x23);
+            return true;
+
+        default:
+            /* C.FLD / C.FLW / C.FSD / C.FSW / reserved: 没有 F/D 扩展 */
+            return false;
+        }
+    }
+
+    /* ======================= Quadrant 1 ======================= */
+    if (q == 1) {
+        switch (f3) {
+        case 0: /* C.NOP / C.ADDI */
+            simm = sext(c_imm6(c), 5);
+            *out32 = enc_i(simm, rd, 0, rd, 0x13);
+            return true;
+
+        case 1: /* RV32: C.JAL → jal x1, offset */
+            simm = sext(c_imm_j(c), 11);
+            *out32 = enc_j(simm, 1, 0x6F);
+            return true;
+
+        case 2: /* C.LI: addi rd, x0, imm */
+            simm = sext(c_imm6(c), 5);
+            *out32 = enc_i(simm, 0, 0, rd, 0x13);
+            return true;
+
+        case 3:
+            if (rd == 2) {
+                /* C.ADDI16SP: addi sp, sp, imm */
+                imm = c_imm_addi16sp(c);
+                if (imm == 0) return false;
+                simm = sext(imm, 9);
+                *out32 = enc_i(simm, 2, 0, 2, 0x13);
+                return true;
+            }
+            if (rd == 0) {
+                return false;                       /* 保留编码 */
+            }
+            /* C.LUI: lui rd, nzimm[17:12] */
+            imm = c_imm6(c);
+            if (imm == 0) return false;
+            simm = sext(imm, 5) << 12;
+            *out32 = enc_u(simm, rd, 0x37);
+            return true;
+
+        case 4: {
+            /* 算术/逻辑: 先看 funct2 */
+            u32 f2 = (c >> 10) & 3u;
+
+            if (f2 == 0 || f2 == 1) {
+                /* C.SRLI / C.SRAI: shamt[5] 在 RV32 上必须为 0 */
+                imm = (((c >> 12) & 1u) << 5) | ((c >> 2) & 0x1Fu);
+                if (imm >= 32u) return false;
+                /* 注意: 这里只有一个寄存器字段 (bits[9:7]), 既是源也是目标 */
+                *out32 = enc_i((s32)(imm | (f2 == 1 ? 0x400u : 0u)),
+                               C_RS1P(c), 5, C_RS1P(c), 0x13);
+                return true;
+            }
+            if (f2 == 2) {
+                /* C.ANDI */
+                simm = sext(c_imm6(c), 5);
+                *out32 = enc_i(simm, C_RS1P(c), 7, C_RS1P(c), 0x13);
+                return true;
+            }
+
+            /* f2 == 3: C.SUB / C.XOR / C.OR / C.AND (bit12=0)
+             *          C.SUBW / C.ADDW (bit12=1, RV64 only) */
+            if ((c >> 12) & 1u) {
+                return false;                       /* RV64 指令 */
+            }
+            switch ((c >> 5) & 3u) {
+            case 0:
+                *out32 = enc_r(0x20, C_RS2P(c), C_RS1P(c), 0, C_RS1P(c), 0x33);
+                return true;
+            case 1:
+                *out32 = enc_r(0x00, C_RS2P(c), C_RS1P(c), 4, C_RS1P(c), 0x33);
+                return true;
+            case 2:
+                *out32 = enc_r(0x00, C_RS2P(c), C_RS1P(c), 6, C_RS1P(c), 0x33);
+                return true;
+            default:
+                *out32 = enc_r(0x00, C_RS2P(c), C_RS1P(c), 7, C_RS1P(c), 0x33);
+                return true;
+            }
+        }
+
+        case 5: /* C.J → jal x0, offset */
+            simm = sext(c_imm_j(c), 11);
+            *out32 = enc_j(simm, 0, 0x6F);
+            return true;
+
+        case 6: /* C.BEQZ → beq rs1', x0, offset */
+            simm = sext(c_imm_b(c), 8);
+            *out32 = enc_b(simm, 0, C_RS1P(c), 0, 0x63);
+            return true;
+
+        default: /* C.BNEZ → bne rs1', x0, offset */
+            simm = sext(c_imm_b(c), 8);
+            *out32 = enc_b(simm, 0, C_RS1P(c), 1, 0x63);
+            return true;
+        }
+    }
+
+    /* ======================= Quadrant 2 ======================= */
+    if (q == 2) {
+        switch (f3) {
+        case 0: /* C.SLLI: slli rd, rd, shamt */
+            imm = (((c >> 12) & 1u) << 5) | ((c >> 2) & 0x1Fu);
+            if (imm >= 32u) return false;
+            *out32 = enc_i((s32)imm, rd, 1, rd, 0x13);
+            return true;
+
+        case 2: /* C.LWSP: lw rd, uimm(sp) */
+            if (rd == 0) return false;              /* 保留编码 */
+            imm = c_uimm_lwsp(c);
+            *out32 = enc_i((s32)imm, 2, 2, rd, 0x03);
+            return true;
+
+        case 4:
+            if (((c >> 12) & 1u) == 0) {
+                if (rs2 == 0) {
+                    /* C.JR: jalr x0, 0(rs1) */
+                    if (rd == 0) return false;      /* 保留编码 */
+                    *out32 = enc_i(0, rd, 0, 0, 0x67);
+                } else {
+                    /* C.MV: add rd, x0, rs2 */
+                    *out32 = enc_r(0, rs2, 0, 0, rd, 0x33);
+                }
+                return true;
+            }
+
+            if (rs2 == 0) {
+                if (rd == 0) {
+                    /* C.EBREAK */
+                    *out32 = 0x00100073u;
+                } else {
+                    /* C.JALR: jalr x1, 0(rs1) */
+                    *out32 = enc_i(0, rd, 0, 1, 0x67);
+                }
+                return true;
+            }
+
+            /* C.ADD: add rd, rd, rs2 */
+            *out32 = enc_r(0, rs2, rd, 0, rd, 0x33);
+            return true;
+
+        case 6: /* C.SWSP: sw rs2, uimm(sp) */
+            imm = c_uimm_swsp(c);
+            *out32 = enc_s((s32)imm, rs2, 2, 2, 0x23);
+            return true;
+
+        default:
+            /* C.FLDSP / C.FLWSP / C.FSDSP / C.FSWSP / reserved */
+            return false;
+        }
+    }
+
+    return false;
 }
 
 /* =========================== 反汇编 (调试用) =========================== */

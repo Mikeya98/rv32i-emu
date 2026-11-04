@@ -1,10 +1,10 @@
-# RV32IMA Emulator — 纯 C 手写 RISC-V CPU 模拟器
+# RV32IMAC Emulator — 纯 C 手写 RISC-V CPU 模拟器
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![ISA](https://img.shields.io/badge/ISA-RV32IMA-brightgreen.svg)](https://riscv.org/)
+[![ISA](https://img.shields.io/badge/ISA-RV32IMAC-brightgreen.svg)](https://riscv.org/)
 [![Language](https://img.shields.io/badge/language-C11-orange.svg)]()
 
-一个从零手写的 **RISC-V RV32IMA 指令集模拟器**，纯 C 实现，零依赖。
+一个从零手写的 **RISC-V RV32IMAC 指令集模拟器**，纯 C 实现，零依赖。
 
 **不需要开发板，也不需要交叉编译工具链。** `make && make demo` 就能跑起来；仓库里的 `tests/gen_demo_elf.py` 用 Python 手写了一个小汇编器，直接生成可加载的 ELF。
 
@@ -13,6 +13,7 @@
 - **RV32I 基础整数指令集** — 40 条指令：ALU、load/store、分支跳转、LUI/AUIPC、CSR
 - **RV32M 乘除法** — mul/mulh/mulhsu/mulhu/div/divu/rem/remu，含除零和溢出语义
 - **RV32A 原子指令** — lr.w / sc.w / amoswap / amoadd / amoxor / amoand / amoor / amomin / amomax / amominu / amomaxu；单 hart 用 (valid, addr) 保留集实现 LR/SC，任何命中地址的写都会让 SC 失败
+- **RV32C 压缩指令** — 16 位指令先展开成等价的 32 位指令，再复用 RV32I 的执行路径；覆盖 c.addi/c.li/c.lui/c.addi4spn/c.addi16sp、c.lw/c.sw/c.lwsp/c.swsp、c.slli/c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and、c.beqz/c.bnez/c.j/c.jal/c.jr/c.jalr/c.mv/c.add/c.ebreak；取指按 2 字节对齐，`jal/jalr` 的链接值也是 pc+2
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
 - **系统调用** — `ecall` 按 a7 分发（exit / write），接近 RISC-V Linux ABI
@@ -23,7 +24,7 @@
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，共 218 项，`make test` 全过
 
 ## 快速开始
 
@@ -50,6 +51,9 @@ make s-demo
 
 # RV32A demo：LR/SC 成功/失败 + AMOADD/AMOMAXU
 make atomic-demo
+
+# RV32C demo：整段程序只用 16 位指令，打印一行字符串
+make rvc-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -102,7 +106,7 @@ breakpoint 0 set at 0x00010034
 ```
 main.c → emu.c (fetch→decode→execute)
            ├── elf.c       ELF 解析器
-           ├── decode.c    指令解码 + 反汇编
+           ├── decode.c    指令解码 + RV32C 展开 + 反汇编
            ├── execute.c   执行引擎 (RV32I + RV32M + RV32A + ecall)
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
