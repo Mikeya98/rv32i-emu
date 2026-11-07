@@ -17,6 +17,9 @@ u32 csr_read(csr_t *csr, u32 addr, bool *ok)
     if (ok) *ok = true;
 
     switch (addr) {
+    case CSR_FFLAGS:   return csr->fflags & 0x1Fu;
+    case CSR_FRM:      return csr->frm & 0x7u;
+    case CSR_FCSR:     return ((csr->frm & 0x7u) << 5) | (csr->fflags & 0x1Fu);
     case CSR_MSTATUS:  return csr->mstatus;
     case CSR_SSTATUS:  return csr->mstatus & SSTATUS_MASK;
     case CSR_SATP:     return csr->satp;
@@ -48,6 +51,12 @@ void csr_write(csr_t *csr, u32 addr, u32 val, bool *ok)
     if (ok) *ok = true;
 
     switch (addr) {
+    case CSR_FFLAGS:   csr->fflags = val & 0x1Fu; break;
+    case CSR_FRM:      csr->frm    = val & 0x7u;  break;
+    case CSR_FCSR:
+        csr->frm    = (val >> 5) & 0x7u;
+        csr->fflags = val & 0x1Fu;
+        break;
     case CSR_MSTATUS:  csr->mstatus  = val; break;
     /* sstatus 只能改 mstatus 里属于 S 态的那几位 */
     case CSR_SSTATUS:
@@ -132,4 +141,7 @@ void csr_dump(csr_t *csr)
            csr->stvec, csr->sepc, csr->scause, csr->stval);
     printf("  medeleg  = 0x%08X  mideleg = 0x%08X\n",
            csr->medeleg, csr->mideleg);
+    printf("  fcsr     = 0x%02X  (frm=%u fflags=0x%02X)\n",
+           ((csr->frm & 7u) << 5) | (csr->fflags & 0x1Fu),
+           csr->frm & 7u, csr->fflags & 0x1Fu);
 }

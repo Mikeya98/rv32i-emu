@@ -30,6 +30,9 @@
 #define CSR_STVAL       0x143
 #define CSR_SIP         0x144
 #define CSR_SATP        0x180
+#define CSR_FFLAGS      0x001   /* 浮点异常标志 (v0.8 RV32F) */
+#define CSR_FRM         0x002   /* 浮点舍入模式 */
+#define CSR_FCSR        0x003   /* frm[7:5] | fflags[4:0] */
 #define CSR_MSTATUS     0x300
 #define CSR_MEDELEG     0x302
 #define CSR_MIDELEG     0x303
@@ -101,6 +104,10 @@
 typedef struct {
     u32  mstatus;
     u32  satp;         /* Sv32: MODE[31] | ASID[30:22] | PPN[21:0] */
+
+    /* 浮点 (v0.8): fcsr = frm << 5 | fflags */
+    u32  fflags;       /* NV=4 DZ=3 OF=2 UF=1 NX=0 */
+    u32  frm;          /* 0=RNE 1=RTZ 2=RDN 3=RUP 4=RMM 7=动态 */
 
     /* S 态 (v0.5) */
     u32  stvec;

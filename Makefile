@@ -8,13 +8,13 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -o $@ $^
+	$(CC) $(CFLAGS) -o $@ $^ -lm
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(BUILDDIR)
@@ -62,6 +62,12 @@ rvc-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_compressed_demo.py $(BUILDDIR)/rvc_demo.elf
 	$(TARGET) $(BUILDDIR)/rvc_demo.elf
+
+# RV32F 浮点 demo: fadd/fmul/fsqrt/fcvt + 内存往返
+f-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_f_demo.py $(BUILDDIR)/f_demo.elf
+	$(TARGET) $(BUILDDIR)/f_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

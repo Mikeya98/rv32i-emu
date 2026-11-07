@@ -12,6 +12,7 @@
 
 #include "execute.h"
 #include "csr.h"
+#include "fpu.h"
 #include "trap.h"
 #include "mmu.h"
 #include <stdio.h>
@@ -240,6 +241,28 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         reg_write(&emu->rf, inst->rd, result);
         break;
 
+    /* ===================== FLW (v0.8) ===================== */
+    case OP_LOAD_FP:
+        if (inst->funct3 != 2u) {
+            goto unknown;       /* FLD/FLQ 没有实现 */
+        }
+        addr = rs1_val + inst->imm;
+        if (addr & 3u) {
+            fault_cause = EXC_LOAD_MISALIGNED;
+            goto except;
+        }
+        xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
+        if (xrc != 0) {
+            fault_cause = xrc;
+            goto except;
+        }
+        if (!memory_read32(&emu->mem, pa, &b32)) {
+            fault_cause = EXC_LOAD_ACCESS;
+            goto except;
+        }
+        emu->rf.fregs[inst->rd] = b32;
+        break;
+
     /* ===================== STORE ===================== */
     case OP_STORE:
         addr = rs1_val + inst->imm;
@@ -286,6 +309,37 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         /* 普通 store 命中 LR 保留地址 → 保留失效 */
         if (emu->reservation_valid && emu->reservation_addr == pa) {
             emu->reservation_valid = 0;
+        }
+        break;
+
+    /* ===================== FSW (v0.8) ===================== */
+    case OP_STORE_FP:
+        if (inst->funct3 != 2u) {
+            goto unknown;
+        }
+        addr = rs1_val + inst->imm;
+        if (addr & 3u) {
+            fault_cause = EXC_STORE_MISALIGNED;
+            goto except;
+        }
+        xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+        if (xrc != 0) {
+            fault_cause = xrc;
+            goto except;
+        }
+        if (!memory_write32(&emu->mem, pa, emu->rf.fregs[inst->rs2])) {
+            fault_cause = EXC_STORE_ACCESS;
+            goto except;
+        }
+        if (emu->reservation_valid && emu->reservation_addr == pa) {
+            emu->reservation_valid = 0;
+        }
+        break;
+
+    /* ===================== RV32F 浮点运算 (v0.8) ===================== */
+    case OP_FP:
+        if (!fpu_execute(emu, inst)) {
+            goto unknown;
         }
         break;
 

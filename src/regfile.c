@@ -18,6 +18,7 @@ static const char *abi_names[] = {
 void regfile_init(regfile_t *rf)
 {
     memset(rf->regs, 0, sizeof(rf->regs));
+    memset(rf->fregs, 0, sizeof(rf->fregs));
     rf->pc = 0;
 }
 
@@ -31,6 +32,18 @@ void reg_write(regfile_t *rf, u32 idx, u32 val)
 {
     if (idx == 0 || idx >= REG_COUNT) return;  /* x0 忽略写入 */
     rf->regs[idx] = val;
+}
+
+void regfile_dump_f(regfile_t *rf)
+{
+    int i;
+
+    printf("\nFP registers (f0-f31, raw bits):\n");
+    for (i = 0; i < 32; i += 4) {
+        printf("  f%-2d=0x%08X  f%-2d=0x%08X  f%-2d=0x%08X  f%-2d=0x%08X\n",
+               i, rf->fregs[i], i + 1, rf->fregs[i + 1],
+               i + 2, rf->fregs[i + 2], i + 3, rf->fregs[i + 3]);
+    }
 }
 
 void regfile_dump(regfile_t *rf)

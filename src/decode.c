@@ -78,8 +78,11 @@ static inst_fmt_t get_fmt(opcode_t op)
     case OP_ALUI:   return FMT_I;
     case OP_LOAD:   return FMT_I;
     case OP_JALR:   return FMT_I;
+    case OP_LOAD_FP: return FMT_I;
     case OP_STORE:  return FMT_S;
+    case OP_STORE_FP: return FMT_S;
     case OP_AMO:    return FMT_R;
+    case OP_FP:     return FMT_R;
     case OP_BRANCH: return FMT_B;
     case OP_LUI:    return FMT_U;
     case OP_AUIPC:  return FMT_U;
@@ -617,6 +620,84 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
     case OP_FENCE:
         snprintf(buf, buf_size, "fence");
         break;
+
+    case OP_LOAD_FP:
+        if (inst->funct3 == 2) {
+            snprintf(buf, buf_size, "flw f%u, %d(%s)",
+                     inst->rd, inst->imm, rn(inst->rs1));
+        }
+        break;
+
+    case OP_STORE_FP:
+        if (inst->funct3 == 2) {
+            snprintf(buf, buf_size, "fsw f%u, %d(%s)",
+                     inst->rs2, inst->imm, rn(inst->rs1));
+        }
+        break;
+
+    case OP_FP: {
+        u32 f7 = inst->funct7;
+
+        if (f7 == 0x00 || f7 == 0x04 || f7 == 0x08 || f7 == 0x0C) {
+            const char *n = (f7 == 0x00) ? "fadd.s" :
+                            (f7 == 0x04) ? "fsub.s" :
+                            (f7 == 0x08) ? "fmul.s" : "fdiv.s";
+            snprintf(buf, buf_size, "%s f%u, f%u, f%u",
+                     n, inst->rd, inst->rs1, inst->rs2);
+        } else if (f7 == 0x2C) {
+            snprintf(buf, buf_size, "fsqrt.s f%u, f%u",
+                     inst->rd, inst->rs1);
+        } else if (f7 == 0x10) {
+            const char *n = (inst->funct3 == 0) ? "fsgnj.s" :
+                            (inst->funct3 == 1) ? "fsgnjn.s" :
+                            (inst->funct3 == 2) ? "fsgnjx.s" : NULL;
+            if (n) {
+                snprintf(buf, buf_size, "%s f%u, f%u, f%u",
+                         n, inst->rd, inst->rs1, inst->rs2);
+            }
+        } else if (f7 == 0x14) {
+            const char *n = (inst->funct3 == 0) ? "fmin.s" :
+                            (inst->funct3 == 1) ? "fmax.s" : NULL;
+            if (n) {
+                snprintf(buf, buf_size, "%s f%u, f%u, f%u",
+                         n, inst->rd, inst->rs1, inst->rs2);
+            }
+        } else if (f7 == 0x50) {
+            const char *n = (inst->funct3 == 0) ? "fle.s" :
+                            (inst->funct3 == 1) ? "flt.s" :
+                            (inst->funct3 == 2) ? "feq.s" : NULL;
+            if (n) {
+                snprintf(buf, buf_size, "%s %s, f%u, f%u",
+                         n, rn(inst->rd), inst->rs1, inst->rs2);
+            }
+        } else if (f7 == 0x60) {
+            const char *n = (inst->rs2 == 0) ? "fcvt.w.s" :
+                            (inst->rs2 == 1) ? "fcvt.wu.s" : NULL;
+            if (n) {
+                snprintf(buf, buf_size, "%s %s, f%u",
+                         n, rn(inst->rd), inst->rs1);
+            }
+        } else if (f7 == 0x68) {
+            const char *n = (inst->rs2 == 0) ? "fcvt.s.w" :
+                            (inst->rs2 == 1) ? "fcvt.s.wu" : NULL;
+            if (n) {
+                snprintf(buf, buf_size, "%s f%u, %s",
+                         n, inst->rd, rn(inst->rs1));
+            }
+        } else if (f7 == 0x70) {
+            if (inst->funct3 == 0) {
+                snprintf(buf, buf_size, "fmv.x.w %s, f%u",
+                         rn(inst->rd), inst->rs1);
+            } else if (inst->funct3 == 1) {
+                snprintf(buf, buf_size, "fclass.s %s, f%u",
+                         rn(inst->rd), inst->rs1);
+            }
+        } else if (f7 == 0x78) {
+            snprintf(buf, buf_size, "fmv.w.x f%u, %s",
+                     inst->rd, rn(inst->rs1));
+        }
+        break;
+    }
 
     case OP_AMO: {
         const char *n = amo_name(inst->funct7 >> 2);

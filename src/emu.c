@@ -214,5 +214,6 @@ void emu_dump_state(emulator_t *emu)
         printf("  exit_code = %u\n", emu->exit_code);
     }
     regfile_dump(&emu->rf);
+    regfile_dump_f(&emu->rf);
     csr_dump(&emu->csr);
 }

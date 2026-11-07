@@ -1,10 +1,10 @@
-# RV32IMAC Emulator — 纯 C 手写 RISC-V CPU 模拟器
+# RV32IMAFC Emulator — 纯 C 手写 RISC-V CPU 模拟器
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![ISA](https://img.shields.io/badge/ISA-RV32IMAC-brightgreen.svg)](https://riscv.org/)
+[![ISA](https://img.shields.io/badge/ISA-RV32IMAFC-brightgreen.svg)](https://riscv.org/)
 [![Language](https://img.shields.io/badge/language-C11-orange.svg)]()
 
-一个从零手写的 **RISC-V RV32IMAC 指令集模拟器**，纯 C 实现，零依赖。
+一个从零手写的 **RISC-V RV32IMAFC 指令集模拟器**，纯 C 实现，零依赖。
 
 **不需要开发板，也不需要交叉编译工具链。** `make && make demo` 就能跑起来；仓库里的 `tests/gen_demo_elf.py` 用 Python 手写了一个小汇编器，直接生成可加载的 ELF。
 
@@ -13,6 +13,7 @@
 - **RV32I 基础整数指令集** — 40 条指令：ALU、load/store、分支跳转、LUI/AUIPC、CSR
 - **RV32M 乘除法** — mul/mulh/mulhsu/mulhu/div/divu/rem/remu，含除零和溢出语义
 - **RV32A 原子指令** — lr.w / sc.w / amoswap / amoadd / amoxor / amoand / amoor / amomin / amomax / amominu / amomaxu；单 hart 用 (valid, addr) 保留集实现 LR/SC，任何命中地址的写都会让 SC 失败
+- **RV32F 单精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.s/fcvt.wu.s/fcvt.s.w/fcvt.s.wu、fmv.x.w/fmv.w.x/fclass、flw/fsw；fflags/frm/fcsr 三个 CSR，舍入和异常标志走宿主 fenv
 - **RV32C 压缩指令** — 16 位指令先展开成等价的 32 位指令，再复用 RV32I 的执行路径；覆盖 c.addi/c.li/c.lui/c.addi4spn/c.addi16sp、c.lw/c.sw/c.lwsp/c.swsp、c.slli/c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and、c.beqz/c.bnez/c.j/c.jal/c.jr/c.jalr/c.mv/c.add/c.ebreak；取指按 2 字节对齐，`jal/jalr` 的链接值也是 pc+2
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
@@ -24,7 +25,7 @@
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项，共 218 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F 33 项，共 251 项，`make test` 全过
 
 ## 快速开始
 
@@ -54,6 +55,9 @@ make atomic-demo
 
 # RV32C demo：整段程序只用 16 位指令，打印一行字符串
 make rvc-demo
+
+# RV32F demo：浮点加减乘除、开方、转换、存回内存
+make f-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -95,7 +99,7 @@ breakpoint 0 set at 0x00010034
 |------|------|
 | `s [n]` | 单步 n 条（默认 1），执行前后各打印一条反汇编 |
 | `c` | 继续运行，遇到断点或停机时返回 |
-| `r` | 打印 32 个寄存器和 CSR |
+| `r` | 打印 32 个整数寄存器、32 个浮点寄存器和 CSR |
 | `x <addr> [n]` | 按字节 dump 内存 |
 | `d [addr] [n]` | 反汇编 n 条指令 |
 | `b <addr>` / `bl` / `bd <addr>` / `bc` | 断点增删查清 |
@@ -108,10 +112,11 @@ main.c → emu.c (fetch→decode→execute)
            ├── elf.c       ELF 解析器
            ├── decode.c    指令解码 + RV32C 展开 + 反汇编
            ├── execute.c   执行引擎 (RV32I + RV32M + RV32A + ecall)
+           ├── fpu.c       RV32F 浮点运算 + fflags/frm
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
            ├── mmu.c       Sv32 分页 (页表遍历 / 权限 / A-D 位)
-           ├── regfile.c   寄存器文件 (x0-x31 + PC)
+           ├── regfile.c   寄存器文件 (x0-x31 + f0-f31 + PC)
            ├── memory.c    1MB 内存 + MMIO UART
            └── csr.c       CSR 控制寄存器
 ```
@@ -176,6 +181,14 @@ SRAM
 - `A` — `amoadd.w` 返回旧值 9，mem 变成 16
 - `M` — `amomaxu.w` 返回旧值 16（max(16, 7) = 16）
 
+`tests/gen_f_demo.py` 演示 RV32F。数据页里放 1.5f、2.25f、9.0f，用 `flw` 读进 f 寄存器，依次算 `fadd`、`fmul`、`fsqrt`、`fcvt.w.s`，最后把结果用 `fsw` 写回内存、再用 `lw` 读原始位验证。每项成功打印一个 `F`：
+
+```
+$ make f-demo
+FFFFF
+[SYSTEM] exit(0)
+```
+
 ## 进度
 
 | 模块 | 状态 |
@@ -195,6 +208,7 @@ SRAM
 | U 态 + 特权级切换 (MPP / mret / 特权指令陷入) | ✅ |
 | S 态 + 异常委托 (medeleg / mideleg / stvec / sret / SUM) | ✅ |
 | RV32A 原子指令 (LR/SC + 11 条 AMO) | ✅ |
+| RV32F 单精度浮点 (F 扩展 + fcsr) | ✅ |
 
 ## License
 

@@ -12,6 +12,7 @@
 #include "emu.h"
 #include "decode.h"
 #include "execute.h"
+#include "fpu.h"
 #include "debug.h"
 #include "trap.h"
 #include "mmu.h"
@@ -58,8 +59,8 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.7                 │\n");
-    printf("│  RV32IMAC + trap + Sv32 + S/U-mode    │\n");
+    printf("│  RV32I Emulator v0.8                 │\n");
+    printf("│  RV32IMAFC + trap + Sv32 + S/U-mode   │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
@@ -71,6 +72,7 @@ int main(int argc, char *argv[])
         trap_selftest();
         trap_smode_selftest();
         mmu_selftest();
+        fpu_selftest();
         emu_free(&emu);
         return 0;
     }

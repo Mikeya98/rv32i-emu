@@ -15,6 +15,7 @@
 
 typedef struct {
     u32  regs[REG_COUNT];  /* x0..x31 */
+    u32  fregs[REG_COUNT]; /* f0..f31 — RV32F, FLEN=32, 存原始位模式 */
     u32  pc;               /* 程序计数器 (当前指令地址) */
 } regfile_t;
 
@@ -28,5 +29,8 @@ void  reg_write(regfile_t *rf, u32 idx, u32 val);
 
 /* 调试: 打印全部寄存器 */
 void  regfile_dump(regfile_t *rf);
+
+/* 调试: 打印 f0-f31 的原始位模式 (RV32F) */
+void  regfile_dump_f(regfile_t *rf);
 
 #endif /* _RVEMU_REGFILE_H */

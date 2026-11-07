@@ -31,10 +31,13 @@ typedef enum {
     OP_BRANCH   = 0x63,   /* 1100011 */
     OP_LOAD     = 0x03,   /* 0000011 */
     OP_STORE    = 0x23,   /* 0100011 */
+    OP_LOAD_FP  = 0x07,   /* 0000111  FLW/FLD (v0.8) */
+    OP_STORE_FP = 0x27,   /* 0100111  FSW/FSD (v0.8) */
     OP_ALUI     = 0x13,   /* 0010011 */
     OP_ALU      = 0x33,   /* 0110011 */
     OP_FENCE    = 0x0F,   /* 0001111 */
     OP_AMO      = 0x2F,   /* 0101111  RV32A 原子指令 */
+    OP_FP       = 0x53,   /* 1010011  RV32F 浮点运算 (v0.8) */
     OP_SYSTEM   = 0x73,   /* 1110011 */
 } opcode_t;
 
