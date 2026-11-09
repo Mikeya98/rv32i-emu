@@ -1,3 +1,7 @@
+# 被 include 的 .d 文件里也有规则, 不显式指定的话默认目标会变成
+# 第一条 .o 规则（比如 build/csr.o），`make` 就只检查一个文件。
+.DEFAULT_GOAL := all
+
 CC       = gcc
 CFLAGS   = -Wall -Wextra -std=c11 -O2 -g
 INCDIR   = include
@@ -7,6 +11,11 @@ TARGET   = $(BUILDDIR)/rvemu
 
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
+DEPS     = $(OBJS:.o=.d)
+
+# 头文件依赖: 改结构体布局后相关的 .o 必须重编, 否则旧目标文件
+# 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
+-include $(DEPS)
 
 .PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo
 
@@ -18,7 +27,7 @@ $(TARGET): $(OBJS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(BUILDDIR)
-	$(CC) $(CFLAGS) -I$(INCDIR) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -I$(INCDIR) -c -o $@ $<
 
 run: $(TARGET)
 	$(TARGET) $(BIN)
