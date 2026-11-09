@@ -8,7 +8,7 @@ TARGET   = $(BUILDDIR)/rvemu
 SRCS     = $(wildcard $(SRCDIR)/*.c)
 OBJS     = $(SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo
 
 all: $(TARGET)
 
@@ -68,6 +68,12 @@ f-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_f_demo.py $(BUILDDIR)/f_demo.elf
 	$(TARGET) $(BUILDDIR)/f_demo.elf
+
+# RV32D 双精度 demo: fadd/fmul/fsqrt/fcvt + 64 位内存往返
+d-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_d_demo.py $(BUILDDIR)/d_demo.elf
+	$(TARGET) $(BUILDDIR)/d_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

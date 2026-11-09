@@ -6,7 +6,7 @@
  *   rvemu <riscv-elf>            直接运行到 ecall/ebreak
  *   rvemu -d <riscv-elf>         进入交互式调试器
  *   rvemu --steps N <riscv-elf>  最多执行 N 条指令
- *   rvemu --selftest             解码 / 执行 / trap / Sv32 自测
+ *   rvemu --selftest             解码 / 执行 / trap / Sv32 / FPU 自测
  */
 
 #include "emu.h"
@@ -59,8 +59,8 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.8                 │\n");
-    printf("│  RV32IMAFC + trap + Sv32 + S/U-mode   │\n");
+    printf("│  RV32I Emulator v0.9                 │\n");
+    printf("│  RV32IMAFC + D + Sv32 + S/U-mode     │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);

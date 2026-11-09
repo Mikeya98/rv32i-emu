@@ -38,11 +38,12 @@ void regfile_dump_f(regfile_t *rf)
 {
     int i;
 
-    printf("\nFP registers (f0-f31, raw bits):\n");
-    for (i = 0; i < 32; i += 4) {
-        printf("  f%-2d=0x%08X  f%-2d=0x%08X  f%-2d=0x%08X  f%-2d=0x%08X\n",
-               i, rf->fregs[i], i + 1, rf->fregs[i + 1],
-               i + 2, rf->fregs[i + 2], i + 3, rf->fregs[i + 3]);
+    printf("\nFP registers (f0-f31, FLEN=64 raw bits):\n");
+    printf("  (单精度值以 NaN-box 存放: 高 32 位全 1)\n");
+    for (i = 0; i < 32; i += 2) {
+        printf("  f%-2d=0x%016llX  f%-2d=0x%016llX\n",
+               i, (unsigned long long)rf->fregs[i],
+               i + 1, (unsigned long long)rf->fregs[i + 1]);
     }
 }
 

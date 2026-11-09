@@ -625,6 +625,9 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
         if (inst->funct3 == 2) {
             snprintf(buf, buf_size, "flw f%u, %d(%s)",
                      inst->rd, inst->imm, rn(inst->rs1));
+        } else if (inst->funct3 == 3) {
+            snprintf(buf, buf_size, "fld f%u, %d(%s)",
+                     inst->rd, inst->imm, rn(inst->rs1));
         }
         break;
 
@@ -632,65 +635,85 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
         if (inst->funct3 == 2) {
             snprintf(buf, buf_size, "fsw f%u, %d(%s)",
                      inst->rs2, inst->imm, rn(inst->rs1));
+        } else if (inst->funct3 == 3) {
+            snprintf(buf, buf_size, "fsd f%u, %d(%s)",
+                     inst->rs2, inst->imm, rn(inst->rs1));
         }
         break;
 
     case OP_FP: {
         u32 f7 = inst->funct7;
+        const char *sfx = (f7 & 1u) ? "d" : "s";   /* S/D 编码只差最低位 */
+        char name[16];
 
-        if (f7 == 0x00 || f7 == 0x04 || f7 == 0x08 || f7 == 0x0C) {
-            const char *n = (f7 == 0x00) ? "fadd.s" :
-                            (f7 == 0x04) ? "fsub.s" :
-                            (f7 == 0x08) ? "fmul.s" : "fdiv.s";
-            snprintf(buf, buf_size, "%s f%u, f%u, f%u",
-                     n, inst->rd, inst->rs1, inst->rs2);
-        } else if (f7 == 0x2C) {
-            snprintf(buf, buf_size, "fsqrt.s f%u, f%u",
+        if (f7 == 0x20 && inst->rs2 == 1) {        /* FCVT.S.D */
+            snprintf(buf, buf_size, "fcvt.s.d f%u, f%u",
                      inst->rd, inst->rs1);
-        } else if (f7 == 0x10) {
-            const char *n = (inst->funct3 == 0) ? "fsgnj.s" :
-                            (inst->funct3 == 1) ? "fsgnjn.s" :
-                            (inst->funct3 == 2) ? "fsgnjx.s" : NULL;
-            if (n) {
+        } else if (f7 == 0x21 && inst->rs2 == 0) { /* FCVT.D.S */
+            snprintf(buf, buf_size, "fcvt.d.s f%u, f%u",
+                     inst->rd, inst->rs1);
+        } else if ((f7 & ~1u) == 0x00 || (f7 & ~1u) == 0x04 ||
+                   (f7 & ~1u) == 0x08 || (f7 & ~1u) == 0x0C) {
+            const char *op = ((f7 & ~1u) == 0x00) ? "fadd" :
+                             ((f7 & ~1u) == 0x04) ? "fsub" :
+                             ((f7 & ~1u) == 0x08) ? "fmul" : "fdiv";
+            snprintf(name, sizeof(name), "%s.%s", op, sfx);
+            snprintf(buf, buf_size, "%s f%u, f%u, f%u",
+                     name, inst->rd, inst->rs1, inst->rs2);
+        } else if ((f7 & ~1u) == 0x2C) {
+            snprintf(name, sizeof(name), "fsqrt.%s", sfx);
+            snprintf(buf, buf_size, "%s f%u, f%u",
+                     name, inst->rd, inst->rs1);
+        } else if ((f7 & ~1u) == 0x10) {
+            const char *op = (inst->funct3 == 0) ? "fsgnj" :
+                             (inst->funct3 == 1) ? "fsgnjn" :
+                             (inst->funct3 == 2) ? "fsgnjx" : NULL;
+            if (op) {
+                snprintf(name, sizeof(name), "%s.%s", op, sfx);
                 snprintf(buf, buf_size, "%s f%u, f%u, f%u",
-                         n, inst->rd, inst->rs1, inst->rs2);
+                         name, inst->rd, inst->rs1, inst->rs2);
             }
-        } else if (f7 == 0x14) {
-            const char *n = (inst->funct3 == 0) ? "fmin.s" :
-                            (inst->funct3 == 1) ? "fmax.s" : NULL;
-            if (n) {
+        } else if ((f7 & ~1u) == 0x14) {
+            const char *op = (inst->funct3 == 0) ? "fmin" :
+                             (inst->funct3 == 1) ? "fmax" : NULL;
+            if (op) {
+                snprintf(name, sizeof(name), "%s.%s", op, sfx);
                 snprintf(buf, buf_size, "%s f%u, f%u, f%u",
-                         n, inst->rd, inst->rs1, inst->rs2);
+                         name, inst->rd, inst->rs1, inst->rs2);
             }
-        } else if (f7 == 0x50) {
-            const char *n = (inst->funct3 == 0) ? "fle.s" :
-                            (inst->funct3 == 1) ? "flt.s" :
-                            (inst->funct3 == 2) ? "feq.s" : NULL;
-            if (n) {
+        } else if ((f7 & ~1u) == 0x50) {
+            const char *op = (inst->funct3 == 0) ? "fle" :
+                             (inst->funct3 == 1) ? "flt" :
+                             (inst->funct3 == 2) ? "feq" : NULL;
+            if (op) {
+                snprintf(name, sizeof(name), "%s.%s", op, sfx);
                 snprintf(buf, buf_size, "%s %s, f%u, f%u",
-                         n, rn(inst->rd), inst->rs1, inst->rs2);
+                         name, rn(inst->rd), inst->rs1, inst->rs2);
             }
-        } else if (f7 == 0x60) {
-            const char *n = (inst->rs2 == 0) ? "fcvt.w.s" :
-                            (inst->rs2 == 1) ? "fcvt.wu.s" : NULL;
-            if (n) {
+        } else if ((f7 & ~1u) == 0x60) {
+            const char *src = (inst->rs2 == 0) ? "w" :
+                              (inst->rs2 == 1) ? "wu" : NULL;
+            if (src) {
+                snprintf(name, sizeof(name), "fcvt.%s.%s", src, sfx);
                 snprintf(buf, buf_size, "%s %s, f%u",
-                         n, rn(inst->rd), inst->rs1);
+                         name, rn(inst->rd), inst->rs1);
             }
-        } else if (f7 == 0x68) {
-            const char *n = (inst->rs2 == 0) ? "fcvt.s.w" :
-                            (inst->rs2 == 1) ? "fcvt.s.wu" : NULL;
-            if (n) {
+        } else if ((f7 & ~1u) == 0x68) {
+            const char *src = (inst->rs2 == 0) ? "w" :
+                              (inst->rs2 == 1) ? "wu" : NULL;
+            if (src) {
+                snprintf(name, sizeof(name), "fcvt.%s.%s", sfx, src);
                 snprintf(buf, buf_size, "%s f%u, %s",
-                         n, inst->rd, rn(inst->rs1));
+                         name, inst->rd, rn(inst->rs1));
             }
-        } else if (f7 == 0x70) {
-            if (inst->funct3 == 0) {
+        } else if ((f7 & ~1u) == 0x70) {
+            if (inst->funct3 == 0 && f7 == 0x70) {
                 snprintf(buf, buf_size, "fmv.x.w %s, f%u",
                          rn(inst->rd), inst->rs1);
             } else if (inst->funct3 == 1) {
-                snprintf(buf, buf_size, "fclass.s %s, f%u",
-                         rn(inst->rd), inst->rs1);
+                snprintf(name, sizeof(name), "fclass.%s", sfx);
+                snprintf(buf, buf_size, "%s %s, f%u",
+                         name, rn(inst->rd), inst->rs1);
             }
         } else if (f7 == 0x78) {
             snprintf(buf, buf_size, "fmv.w.x f%u, %s",

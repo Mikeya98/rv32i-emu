@@ -14,9 +14,9 @@
 #define REG_ZERO    0    /* x0 — zero register */
 
 typedef struct {
-    u32  regs[REG_COUNT];  /* x0..x31 */
-    u32  fregs[REG_COUNT]; /* f0..f31 — RV32F, FLEN=32, 存原始位模式 */
-    u32  pc;               /* 程序计数器 (当前指令地址) */
+    u32  regs[REG_COUNT];   /* x0..x31 */
+    u64  fregs[REG_COUNT];  /* f0..f31 — FLEN=64, 存原始位模式 */
+    u32  pc;                /* 程序计数器 (当前指令地址) */
 } regfile_t;
 
 /* --- API --- */

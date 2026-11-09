@@ -241,27 +241,46 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         reg_write(&emu->rf, inst->rd, result);
         break;
 
-    /* ===================== FLW (v0.8) ===================== */
+    /* ===================== FLW / FLD (v0.8 / v0.9) ===================== */
     case OP_LOAD_FP:
-        if (inst->funct3 != 2u) {
-            goto unknown;       /* FLD/FLQ 没有实现 */
-        }
         addr = rs1_val + inst->imm;
-        if (addr & 3u) {
-            fault_cause = EXC_LOAD_MISALIGNED;
-            goto except;
+
+        if (inst->funct3 == 2u) {           /* FLW: 4 字节对齐, NaN-box */
+            if (addr & 3u) {
+                fault_cause = EXC_LOAD_MISALIGNED;
+                goto except;
+            }
+            xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (!memory_read32(&emu->mem, pa, &b32)) {
+                fault_cause = EXC_LOAD_ACCESS;
+                goto except;
+            }
+            emu->rf.fregs[inst->rd] = fp32_box(b32);
+            break;
         }
-        xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
-        if (xrc != 0) {
-            fault_cause = xrc;
-            goto except;
+
+        if (inst->funct3 == 3u) {           /* FLD: 8 字节对齐 */
+            if (addr & 7u) {
+                fault_cause = EXC_LOAD_MISALIGNED;
+                goto except;
+            }
+            xrc = mmu_translate(emu, addr, ACC_LOAD, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (!memory_read64(&emu->mem, pa, &emu->rf.fregs[inst->rd])) {
+                fault_cause = EXC_LOAD_ACCESS;
+                goto except;
+            }
+            break;
         }
-        if (!memory_read32(&emu->mem, pa, &b32)) {
-            fault_cause = EXC_LOAD_ACCESS;
-            goto except;
-        }
-        emu->rf.fregs[inst->rd] = b32;
-        break;
+
+        goto unknown;
 
     /* ===================== STORE ===================== */
     case OP_STORE:
@@ -312,31 +331,54 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         }
         break;
 
-    /* ===================== FSW (v0.8) ===================== */
+    /* ===================== FSW / FSD (v0.8 / v0.9) ===================== */
     case OP_STORE_FP:
-        if (inst->funct3 != 2u) {
-            goto unknown;
-        }
         addr = rs1_val + inst->imm;
-        if (addr & 3u) {
-            fault_cause = EXC_STORE_MISALIGNED;
-            goto except;
-        }
-        xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
-        if (xrc != 0) {
-            fault_cause = xrc;
-            goto except;
-        }
-        if (!memory_write32(&emu->mem, pa, emu->rf.fregs[inst->rs2])) {
-            fault_cause = EXC_STORE_ACCESS;
-            goto except;
-        }
-        if (emu->reservation_valid && emu->reservation_addr == pa) {
-            emu->reservation_valid = 0;
-        }
-        break;
 
-    /* ===================== RV32F 浮点运算 (v0.8) ===================== */
+        if (inst->funct3 == 2u) {           /* FSW: 只写低 32 位 */
+            if (addr & 3u) {
+                fault_cause = EXC_STORE_MISALIGNED;
+                goto except;
+            }
+            xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (!memory_write32(&emu->mem, pa,
+                                (u32)emu->rf.fregs[inst->rs2])) {
+                fault_cause = EXC_STORE_ACCESS;
+                goto except;
+            }
+            if (emu->reservation_valid && emu->reservation_addr == pa) {
+                emu->reservation_valid = 0;
+            }
+            break;
+        }
+
+        if (inst->funct3 == 3u) {           /* FSD: 8 字节对齐, 写满 64 位 */
+            if (addr & 7u) {
+                fault_cause = EXC_STORE_MISALIGNED;
+                goto except;
+            }
+            xrc = mmu_translate(emu, addr, ACC_STORE, &pa);
+            if (xrc != 0) {
+                fault_cause = xrc;
+                goto except;
+            }
+            if (!memory_write64(&emu->mem, pa, emu->rf.fregs[inst->rs2])) {
+                fault_cause = EXC_STORE_ACCESS;
+                goto except;
+            }
+            if (emu->reservation_valid && emu->reservation_addr == pa) {
+                emu->reservation_valid = 0;
+            }
+            break;
+        }
+
+        goto unknown;
+
+    /* ===================== RV32F / RV32D 浮点运算 (v0.8 / v0.9) ===================== */
     case OP_FP:
         if (!fpu_execute(emu, inst)) {
             goto unknown;

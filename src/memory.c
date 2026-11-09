@@ -58,6 +58,16 @@ bool memory_read32(memory_t *mem, u32 addr, u32 *val)
     return true;
 }
 
+bool memory_read64(memory_t *mem, u32 addr, u64 *val)
+{
+    u32 lo, hi;
+
+    if (!memory_read32(mem, addr, &lo)) return false;
+    if (!memory_read32(mem, addr + 4, &hi)) return false;
+    *val = (u64)lo | ((u64)hi << 32);
+    return true;
+}
+
 bool memory_write8(memory_t *mem, u32 addr, u8 val)
 {
     /* MMIO: UART 输出 */
@@ -85,6 +95,13 @@ bool memory_write32(memory_t *mem, u32 addr, u32 val)
     mem->data[addr + 1] = (u8)((val >>  8) & 0xFF);
     mem->data[addr + 2] = (u8)((val >> 16) & 0xFF);
     mem->data[addr + 3] = (u8)((val >> 24) & 0xFF);
+    return true;
+}
+
+bool memory_write64(memory_t *mem, u32 addr, u64 val)
+{
+    if (!memory_write32(mem, addr, (u32)val)) return false;
+    if (!memory_write32(mem, addr + 4, (u32)(val >> 32))) return false;
     return true;
 }
 

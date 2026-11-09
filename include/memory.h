@@ -35,9 +35,11 @@ u32   memory_load(memory_t *mem, u32 addr, const u8 *src, u32 len);
 bool  memory_read8 (memory_t *mem, u32 addr, u8  *val);
 bool  memory_read16(memory_t *mem, u32 addr, u16 *val);
 bool  memory_read32(memory_t *mem, u32 addr, u32 *val);
+bool  memory_read64(memory_t *mem, u32 addr, u64 *val);
 bool  memory_write8 (memory_t *mem, u32 addr, u8   val);
 bool  memory_write16(memory_t *mem, u32 addr, u16  val);
 bool  memory_write32(memory_t *mem, u32 addr, u32  val);
+bool  memory_write64(memory_t *mem, u32 addr, u64  val);
 
 /* 调试: dump 指定范围 */
 void  memory_dump(memory_t *mem, u32 start, u32 len);
