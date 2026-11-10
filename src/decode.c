@@ -83,6 +83,10 @@ static inst_fmt_t get_fmt(opcode_t op)
     case OP_STORE_FP: return FMT_S;
     case OP_AMO:    return FMT_R;
     case OP_FP:     return FMT_R;
+    case OP_FMADD:  return FMT_R;
+    case OP_FMSUB:  return FMT_R;
+    case OP_FNMSUB: return FMT_R;
+    case OP_FNMADD: return FMT_R;
     case OP_BRANCH: return FMT_B;
     case OP_LUI:    return FMT_U;
     case OP_AUIPC:  return FMT_U;
@@ -640,6 +644,24 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
                      inst->rs2, inst->imm, rn(inst->rs1));
         }
         break;
+
+    case OP_FMADD:
+    case OP_FMSUB:
+    case OP_FNMSUB:
+    case OP_FNMADD: {
+        const char *op = (inst->opcode == OP_FMADD)  ? "fmadd" :
+                         (inst->opcode == OP_FMSUB)  ? "fmsub" :
+                         (inst->opcode == OP_FNMSUB) ? "fnmsub" : "fnmadd";
+        u32 fmt = inst->funct7 & 0x3u;
+        u8  rs3 = (u8)(inst->funct7 >> 2);
+
+        if (fmt <= 1u) {
+            snprintf(buf, buf_size, "%s.%c f%u, f%u, f%u, f%u",
+                     op, (fmt == 0u) ? 's' : 'd',
+                     inst->rd, inst->rs1, inst->rs2, rs3);
+        }
+        break;
+    }
 
     case OP_FP: {
         u32 f7 = inst->funct7;

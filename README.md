@@ -13,6 +13,7 @@
 - **RV32I 基础整数指令集** — 40 条指令：ALU、load/store、分支跳转、LUI/AUIPC、CSR
 - **RV32M 乘除法** — mul/mulh/mulhsu/mulhu/div/divu/rem/remu，含除零和溢出语义
 - **RV32A 原子指令** — lr.w / sc.w / amoswap / amoadd / amoxor / amoand / amoor / amomin / amomax / amominu / amomaxu；单 hart 用 (valid, addr) 保留集实现 LR/SC，任何命中地址的写都会让 SC 失败
+- **融合乘加 FMA** — fmadd/fmsub/fnmsub/fnmadd 的 `.s` 和 `.d` 两种格式；四种形式化成 `fma(a', b, c')`，宿主 `fmaf/fma` 保证只舍入一次。符号变换作用在输入端而不是结果端，避免 RDN/RUP 下"舍入后取反"出错
 - **RV32D 双精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.d/fcvt.wu.d/fcvt.d.w/fcvt.d.wu、fcvt.s.d/fcvt.d.s、fclass.d、fld/fsd；FLEN 从 32 扩到 64，单精度值按 NaN-box 规则存高半字全 1
 - **RV32F 单精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.s/fcvt.wu.s/fcvt.s.w/fcvt.s.wu、fmv.x.w/fmv.w.x/fclass、flw/fsw；fflags/frm/fcsr 三个 CSR，舍入和异常标志走宿主 fenv
 - **RV32C 压缩指令** — 16 位指令先展开成等价的 32 位指令，再复用 RV32I 的执行路径；覆盖 c.addi/c.li/c.lui/c.addi4spn/c.addi16sp、c.lw/c.sw/c.lwsp/c.swsp、c.slli/c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and、c.beqz/c.bnez/c.j/c.jal/c.jr/c.jalr/c.mv/c.add/c.ebreak；取指按 2 字节对齐，`jal/jalr` 的链接值也是 pc+2
@@ -26,7 +27,7 @@
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D 57 项，共 275 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 285 项，`make test` 全过
 
 ## 快速开始
 
@@ -60,7 +61,7 @@ make rvc-demo
 # RV32F demo：浮点加减乘除、开方、转换、存回内存
 make f-demo
 
-# RV32D demo：双精度加减乘除、开方、转换、64 位内存往返
+# RV32D demo：双精度加减乘除、开方、转换、融合乘加、64 位内存往返
 make d-demo
 
 # 在调试器里打开同一个程序
@@ -116,7 +117,7 @@ main.c → emu.c (fetch→decode→execute)
            ├── elf.c       ELF 解析器
            ├── decode.c    指令解码 + RV32C 展开 + 反汇编
            ├── execute.c   执行引擎 (RV32I + RV32M + RV32A + ecall)
-           ├── fpu.c       RV32F 浮点运算 + fflags/frm
+           ├── fpu.c       RV32F/D 浮点运算 + FMA + fflags/frm
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
            ├── mmu.c       Sv32 分页 (页表遍历 / 权限 / A-D 位)
@@ -213,6 +214,9 @@ FFFFF
 | S 态 + 异常委托 (medeleg / mideleg / stvec / sret / SUM) | ✅ |
 | RV32A 原子指令 (LR/SC + 11 条 AMO) | ✅ |
 | RV32F 单精度浮点 (F 扩展 + fcsr) | ✅ |
+| RV32C 压缩指令 (16 位展开) | ✅ |
+| RV32D 双精度浮点 (NaN boxing) | ✅ |
+| 融合乘加 FMA.S / FMA.D | ✅ |
 
 ## License
 

@@ -9,10 +9,11 @@
     4. fsqrt.d 9.0 = 3.0
     5. fcvt.w.d (RTZ) 3.75 = 3
     6. fcvt.s.d 把 1.5 收窄成单精度, 再 fcvt.d.s 加宽回来
+    7. fmadd/fmsub/fnmsub/fnmadd.d: 1.5*2.25 ± 5.0
     每项成功打印一个 'D', 失败打印 'X'
 
 预期输出:
-    DDDDDD
+    DDDDDDDDDD
 
 用法:
     python tests/gen_d_demo.py build/d_demo.elf
@@ -43,6 +44,15 @@ def fsd(imm, fs2, rs1):
            ((imm & 0x1F) << 7) | 0x27
 
 
+def fma(opcode, fmt, rs3, rs2, rs1, rm, rd):
+    return ((rs3 & 0x1F) << 27) | ((fmt & 3) << 25) | \
+           ((rs2 & 0x1F) << 20) | ((rs1 & 0x1F) << 15) | \
+           ((rm & 7) << 12) | ((rd & 0x1F) << 7) | opcode
+
+
+FMADD, FMSUB, FNMSUB, FNMADD = 0x43, 0x47, 0x4B, 0x4F
+
+
 def build():
     asm = Assembler()
     asm.label("_start")
@@ -53,7 +63,9 @@ def build():
     # mem[0..7]   = 1.5   (0x3FF8000000000000)
     # mem[8..15]  = 2.25  (0x4002000000000000)
     # mem[16..23] = 9.0   (0x4022000000000000)
-    for off, hi in ((0, 0x3FF80000), (8, 0x40020000), (16, 0x40220000)):
+    # mem[40..47] = 5.0   (0x4014000000000000)
+    for off, hi in ((0, 0x3FF80000), (8, 0x40020000),
+                    (16, 0x40220000), (40, 0x40140000)):
         asm.emit("li32", "t0", hi)
         asm.emit("sw", "t0", "s3", off + 4)     # 高 32 位
         asm.emit("li32", "t0", 0)
@@ -62,6 +74,7 @@ def build():
     asm.emit("word", fld(0, 19, 1))      # fld f1, 0(s3)
     asm.emit("word", fld(8, 19, 2))      # fld f2, 8(s3)
     asm.emit("word", fld(16, 19, 6))     # fld f6, 16(s3)
+    asm.emit("word", fld(40, 19, 7))     # fld f7, 40(s3)
 
     def check(expr_hi, label):
         """把 f3 写回内存高半字, 和期望值比较, 打印 F/D。"""
@@ -114,6 +127,16 @@ def build():
     asm.emit("li", "s1", ord('D'))
     asm.label("print_bits")
     asm.emit("sb", "s1", "s2", 0)
+
+    # ---- 融合乘加: 1.5*2.25 = 3.375, 加减 5.0 ----
+    asm.emit("word", fma(FMADD,  1, 7, 2, 1, 0, 3))
+    check(0x4020C000, "fmadd")       # 8.375
+    asm.emit("word", fma(FMSUB,  1, 7, 2, 1, 0, 3))
+    check(0xBFFA0000, "fmsub")       # -1.625
+    asm.emit("word", fma(FNMSUB, 1, 7, 2, 1, 0, 3))
+    check(0x3FFA0000, "fnmsub")      # 1.625
+    asm.emit("word", fma(FNMADD, 1, 7, 2, 1, 0, 3))
+    check(0xC020C000, "fnmadd")      # -8.375
 
     # 换行 + exit(0)
     asm.emit("li", "s1", 10)

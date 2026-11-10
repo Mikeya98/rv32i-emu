@@ -378,7 +378,11 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
         goto unknown;
 
-    /* ===================== RV32F / RV32D 浮点运算 (v0.8 / v0.9) ===================== */
+    /* ============== RV32F / RV32D 浮点运算 + 融合乘加 (v0.8 / v0.9 / v0.10) ============== */
+    case OP_FMADD:
+    case OP_FMSUB:
+    case OP_FNMSUB:
+    case OP_FNMADD:
     case OP_FP:
         if (!fpu_execute(emu, inst)) {
             goto unknown;

@@ -197,6 +197,86 @@ static u64 fp_arith_d(emulator_t *emu, u32 rm, int op, u64 abits, u64 bbits)
     return bits;
 }
 
+/* =========================== 融合乘加 (FMA) =========================== */
+
+/*
+ * FMADD = rs1*rs2 + rs3, FMSUB = rs1*rs2 - rs3,
+ * FNMSUB = -(rs1*rs2) + rs3, FNMADD = -(rs1*rs2) - rs3。
+ *
+ * 关键是"只舍入一次": 乘积不先舍入, 和第三操作数合并后只做一次
+ * 舍入。宿主的 fmaf/fma 正好是这个语义, 并且跟随 fesetround。
+ *
+ * 四种形式都能化成 fma(a', b, c'), 符号变换是精确的:
+ *   fmadd  = fma( a, b,  c)
+ *   fmsub  = fma( a, b, -c)
+ *   fnmsub = fma(-a, b,  c)
+ *   fnmadd = fma(-a, b, -c)
+ *
+ * 不能先算 fma(a,b,c) 再把结果取反: 在 RDN/RUP 下, "舍入后取反"
+ * 和 "取反后舍入" 得到的结果不同 (舍入方向不对称)。
+ */
+static u32 fp_fma_s(emulator_t *emu, u32 rm, u32 abits, u32 bbits,
+                    u32 cbits, int neg_a, int neg_c)
+{
+    int old_rm = fegetround();
+    float result;
+    u32 bits;
+
+    if (neg_a) abits ^= 0x80000000u;
+    if (neg_c) cbits ^= 0x80000000u;
+
+    feclearexcept(FE_ALL_EXCEPT);
+    fesetround(host_rounding(rm, emu->csr.frm));
+
+    {
+        volatile float a = bits_to_f32(abits);
+        volatile float b = bits_to_f32(bbits);
+        volatile float c = bits_to_f32(cbits);
+
+        result = fmaf(a, b, c);
+    }
+
+    fesetround(old_rm);
+    fp_collect_flags(emu);
+
+    bits = f32_to_bits(result);
+    if (bits_is_nan(bits)) {
+        bits = FP_CANON_NAN;
+    }
+    return bits;
+}
+
+static u64 fp_fma_d(emulator_t *emu, u32 rm, u64 abits, u64 bbits,
+                    u64 cbits, int neg_a, int neg_c)
+{
+    int old_rm = fegetround();
+    double result;
+    u64 bits;
+
+    if (neg_a) abits ^= 0x8000000000000000ull;
+    if (neg_c) cbits ^= 0x8000000000000000ull;
+
+    feclearexcept(FE_ALL_EXCEPT);
+    fesetround(host_rounding(rm, emu->csr.frm));
+
+    {
+        volatile double a = bits_to_f64(abits);
+        volatile double b = bits_to_f64(bbits);
+        volatile double c = bits_to_f64(cbits);
+
+        result = fma(a, b, c);
+    }
+
+    fesetround(old_rm);
+    fp_collect_flags(emu);
+
+    bits = f64_to_bits(result);
+    if (bits64_is_nan(bits)) {
+        bits = FP_CANON_NAN64;
+    }
+    return bits;
+}
+
 /* =========================== min / max =========================== */
 
 static u32 fp_minmax(emulator_t *emu, u32 abits, u32 bbits, int is_max)
@@ -612,6 +692,37 @@ bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
     u32 b   = fp32_unbox(rb);
     u32 out;
 
+    /*
+     * 融合乘加是独立 opcode (0x43/0x47/0x4B/0x4F), 不是 OP-FP 的
+     * funct7 子功能。编码:
+     *   rs3[31:27] | fmt[26:25] | rs2 | rs1 | rm | rd | opcode
+     * fmt: 00=S, 01=D, 10=H, 11=Q —— 这里只支持 S/D。
+     */
+    if (inst->opcode == OP_FMADD || inst->opcode == OP_FMSUB ||
+        inst->opcode == OP_FNMSUB || inst->opcode == OP_FNMADD) {
+        u32 fmt = f7 & 0x3u;
+        u8  rs3 = (u8)(f7 >> 2);
+        int neg_a = 0;
+        int neg_c = 0;
+
+        if (fmt > 1u) {
+            return false;               /* H / Q 未实现 */
+        }
+        if (inst->opcode == OP_FMSUB)  neg_c = 1;
+        if (inst->opcode == OP_FNMSUB) neg_a = 1;
+        if (inst->opcode == OP_FNMADD) { neg_a = 1; neg_c = 1; }
+
+        if (fmt == 0u) {
+            emu->rf.fregs[rd] = fp32_box(fp_fma_s(
+                emu, f3, a, b, fp32_unbox(emu->rf.fregs[rs3]),
+                neg_a, neg_c));
+        } else {
+            emu->rf.fregs[rd] = fp_fma_d(
+                emu, f3, ra, rb, emu->rf.fregs[rs3], neg_a, neg_c);
+        }
+        return true;
+    }
+
     switch (f7) {
     /* ---------------- 单精度算术 (S) ---------------- */
     case 0x00:      /* FADD.S */
@@ -791,6 +902,13 @@ static u32 enc_fsw(s32 imm, u8 fs2, u8 rs1)
            ((u & 0x1Fu) << 7) | 0x27u;
 }
 
+static u32 enc_fma(u8 opcode, u8 fmt, u8 rs3, u8 rs2, u8 rs1, u8 rm, u8 rd)
+{
+    return ((u32)(rs3 & 0x1F) << 27) | ((u32)(fmt & 3u) << 25) |
+           ((u32)(rs2 & 0x1F) << 20) | ((u32)(rs1 & 0x1F) << 15) |
+           ((u32)(rm & 7) << 12) | ((u32)(rd & 0x1F) << 7) | opcode;
+}
+
 static u32 enc_fld(s32 imm, u8 rs1, u8 fd)
 {
     return (((u32)imm & 0xFFFu) << 20) | ((u32)(rs1 & 0x1F) << 15) |
@@ -830,7 +948,7 @@ void fpu_selftest(void)
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
     printf("║        RV32F/D Self-Test                                 ║\n");
-    printf("║        S/D arith + min/max + cvt + flags + NaN box      ║\n");
+    printf("║     S/D arith + FMA + min/max + cvt + flags + NaN box   ║\n");
     printf("╚══════════════════════════════════════════════════════════╝\n\n");
 
     /* ---------------- FLW / FSW ---------------- */
@@ -1170,6 +1288,72 @@ void fpu_selftest(void)
         csr_write(&emu.csr, CSR_FRM, 0x7u, &ok);
         CHECK(csr_read(&emu.csr, CSR_FRM, &ok) == 7u, "frm accepts dynamic mode");
     }
+    emu_free(&emu);
+
+    /* ---------------- 融合乘加 S (v0.10) ---------------- */
+    printf("── FMA.S (fmadd/fmsub/fnmsub/fnmadd) ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu.state = EMU_RUNNING;
+
+    emu.rf.fregs[1] = sf32(0x3FC00000u);   /* 1.5 */
+    emu.rf.fregs[2] = sf32(0x40100000u);   /* 2.25 */
+    emu.rf.fregs[3] = sf32(0x3F000000u);   /* 0.5 */
+    emu.rf.fregs[4] = sf32(0x3F800001u);   /* 1 + 2^-23 */
+    emu.rf.fregs[5] = sf32(0x3F7FFFFFu);   /* 1 - 2^-24 */
+    emu.rf.fregs[6] = sf32(0xBF800000u);   /* -1.0 */
+
+    mem_write_inst(&emu.mem, base + 0,  enc_fma(OP_FMADD,  0, 3, 2, 1, 0, 10));
+    mem_write_inst(&emu.mem, base + 4,  enc_fma(OP_FMSUB,  0, 3, 2, 1, 0, 11));
+    mem_write_inst(&emu.mem, base + 8,  enc_fma(OP_FNMSUB, 0, 3, 2, 1, 0, 12));
+    mem_write_inst(&emu.mem, base + 12, enc_fma(OP_FNMADD, 0, 3, 2, 1, 0, 13));
+    /*
+     * (1+2^-23)*(1-2^-24) - 1 = 2^-24 - 2^-47。
+     * 先舍入乘积得到 1.0 (正好落在两个 float 中间, RNE 取偶),
+     * 再减 1 就是 0; 只有融合乘加才保留这一位 —— 这就是 FMA 的用处。
+     */
+    mem_write_inst(&emu.mem, base + 16, enc_fma(OP_FMADD,  0, 6, 5, 4, 0, 14));
+    mem_write_inst(&emu.mem, base + 20, 0x00000073);
+
+    emu.rf.pc = base;
+    emu_run(&emu, 6);
+
+    CHECK(emu.rf.fregs[10] == sf32(0x40780000u), "fmadd.s 1.5*2.25+0.5 = 3.875");
+    CHECK(emu.rf.fregs[11] == sf32(0x40380000u), "fmsub.s 1.5*2.25-0.5 = 2.875");
+    CHECK(emu.rf.fregs[12] == sf32(0xC0380000u), "fnmsub.s -(1.5*2.25)+0.5 = -2.875");
+    CHECK(emu.rf.fregs[13] == sf32(0xC0780000u), "fnmadd.s -(1.5*2.25)-0.5 = -3.875");
+    CHECK(emu.rf.fregs[14] == sf32(0x337FFFFEu),
+          "fmadd.s (1+e)*(1-e/2)-1 = 2^-24-2^-47 (fused)");
+    emu_free(&emu);
+
+    /* ---------------- 融合乘加 D (v0.10) ---------------- */
+    printf("── FMA.D ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu.state = EMU_RUNNING;
+
+    emu.rf.fregs[1] = 0x3FF8000000000000ull;   /* 1.5 */
+    emu.rf.fregs[2] = 0x4002000000000000ull;   /* 2.25 */
+    emu.rf.fregs[3] = 0x4014000000000000ull;   /* 5.0 */
+    emu.rf.fregs[4] = 0x3FF0000000000001ull;   /* 1 + 2^-52 */
+    emu.rf.fregs[5] = 0x3FEFFFFFFFFFFFFFull;   /* 1 - 2^-53 */
+    emu.rf.fregs[6] = 0xBFF0000000000000ull;   /* -1.0 */
+
+    mem_write_inst(&emu.mem, base + 0,  enc_fma(OP_FMADD,  1, 3, 2, 1, 0, 20));
+    mem_write_inst(&emu.mem, base + 4,  enc_fma(OP_FMSUB,  1, 3, 2, 1, 0, 21));
+    mem_write_inst(&emu.mem, base + 8,  enc_fma(OP_FNMSUB, 1, 3, 2, 1, 0, 22));
+    mem_write_inst(&emu.mem, base + 12, enc_fma(OP_FNMADD, 1, 3, 2, 1, 0, 23));
+    /* (1+2^-52)*(1-2^-53) - 1 = 2^-53 - 2^-105 */
+    mem_write_inst(&emu.mem, base + 16, enc_fma(OP_FMADD,  1, 6, 5, 4, 0, 24));
+    mem_write_inst(&emu.mem, base + 20, 0x00000073);
+
+    emu.rf.pc = base;
+    emu_run(&emu, 6);
+
+    CHECK(emu.rf.fregs[20] == 0x4020C00000000000ull, "fmadd.d 1.5*2.25+5.0 = 8.375");
+    CHECK(emu.rf.fregs[21] == 0xBFFA000000000000ull, "fmsub.d 1.5*2.25-5.0 = -1.625");
+    CHECK(emu.rf.fregs[22] == 0x3FFA000000000000ull, "fnmsub.d -(1.5*2.25)+5.0 = 1.625");
+    CHECK(emu.rf.fregs[23] == 0xC020C00000000000ull, "fnmadd.d -(1.5*2.25)-5.0 = -8.375");
+    CHECK(emu.rf.fregs[24] == 0x3C9FFFFFFFFFFFFEull,
+          "fmadd.d (1+e)*(1-e/2)-1 = 2^-53-2^-105 (fused)");
     emu_free(&emu);
 
     printf("\n╔══════════════════════════════════════════════════════════╗\n");

@@ -38,6 +38,10 @@ typedef enum {
     OP_FENCE    = 0x0F,   /* 0001111 */
     OP_AMO      = 0x2F,   /* 0101111  RV32A 原子指令 */
     OP_FP       = 0x53,   /* 1010011  RV32F 浮点运算 (v0.8) */
+    OP_FMADD    = 0x43,   /* 1000011  融合乘加   (v0.10) */
+    OP_FMSUB    = 0x47,   /* 1000111  融合乘减   (v0.10) */
+    OP_FNMSUB   = 0x4B,   /* 1001011  负乘加     (v0.10) */
+    OP_FNMADD   = 0x4F,   /* 1001111  负乘减     (v0.10) */
     OP_SYSTEM   = 0x73,   /* 1110011 */
 } opcode_t;
 
