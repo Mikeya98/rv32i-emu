@@ -69,8 +69,25 @@
 #define MSTATUS_SUM        (1u << 18)   /* S 态允许访问 U 页 */
 #define MSTATUS_MPRV       (1u << 17)   /* 未实现, 保留定义 */
 
+/*
+ * mstatus.FS[14:13] (v0.11): 浮点单元状态
+ *   00 Off     —— 浮点关闭, 任何 FP 指令 / fcsr 访问都算非法指令
+ *   01 Initial —— 刚开启, 还没执行过 FP 指令
+ *   10 Clean   —— 执行过, 但上次 trap 之后保存过现场 (本模拟器不主动用)
+ *   11 Dirty   —— 执行过 FP 指令, 现场需要保存
+ *
+ * sstatus 是 mstatus 的受限视图, FS 两位在 S 态也可见/可写。
+ */
+#define MSTATUS_FS_SHIFT   13
+#define MSTATUS_FS_MASK    (3u << MSTATUS_FS_SHIFT)
+#define MSTATUS_FS_OFF     (0u << MSTATUS_FS_SHIFT)
+#define MSTATUS_FS_INITIAL (1u << MSTATUS_FS_SHIFT)
+#define MSTATUS_FS_CLEAN   (2u << MSTATUS_FS_SHIFT)
+#define MSTATUS_FS_DIRTY   (3u << MSTATUS_FS_SHIFT)
+
 /* sstatus 是 mstatus 的一个受限视图 */
-#define SSTATUS_MASK       (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | MSTATUS_SUM)
+#define SSTATUS_MASK       (MSTATUS_SIE | MSTATUS_SPIE | MSTATUS_SPP | \
+                            MSTATUS_SUM | MSTATUS_FS_MASK)
 
 /* 特权级编码 (和 RISC-V 规范一致) */
 #define PRIV_U             0u
@@ -141,6 +158,25 @@ void  csr_dump (csr_t *csr);
 
 /** CSR 地址 [9:8] 编码了最低可访问特权级 (U=0, S=1, M=3) */
 bool  csr_priv_ok(u32 priv, u32 addr);
+
+/** FS != Off: 浮点单元可用 (v0.11) */
+static inline bool csr_fpu_enabled(const csr_t *csr)
+{
+    return (csr->mstatus & MSTATUS_FS_MASK) != 0u;
+}
+
+/**
+ * @brief 执行了一条 FP 指令 / 写了一次浮点 CSR
+ *
+ * 按规范, FS 从 Initial/Clean 变成 Dirty; Off 状态下根本不该走到这里
+ * (调用者应先判非法指令), 这里再挡一道。
+ */
+static inline void csr_fpu_dirty(csr_t *csr)
+{
+    if (csr_fpu_enabled(csr)) {
+        csr->mstatus |= MSTATUS_FS_DIRTY;
+    }
+}
 
 /** CSR 地址 [11:10] == 11 表示只读 */
 bool  csr_writable(u32 addr);

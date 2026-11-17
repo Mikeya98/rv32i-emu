@@ -11,7 +11,12 @@ void trap_init(emulator_t *emu)
 {
     emu->mtime    = 0;
     emu->mtimecmp = 0;      /* 0 = 定时器关闭 */
-    emu->csr.mstatus = 0;
+
+    /*
+     * v0.11: 复位后 FS = Initial。真实硬件也允许复位成 Off, 但那样
+     * 每段浮点程序都得先写 mstatus 才能跑 —— 对模拟器不友好。
+     */
+    emu->csr.mstatus = MSTATUS_FS_INITIAL;
 }
 
 bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)

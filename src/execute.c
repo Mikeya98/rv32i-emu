@@ -243,6 +243,11 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== FLW / FLD (v0.8 / v0.9) ===================== */
     case OP_LOAD_FP:
+        /* v0.11: FS=Off 时浮点 load/store 也是非法指令 */
+        if (!csr_fpu_enabled(&emu->csr)) {
+            fault_cause = EXC_ILLEGAL_INST;
+            goto except;
+        }
         addr = rs1_val + inst->imm;
 
         if (inst->funct3 == 2u) {           /* FLW: 4 字节对齐, NaN-box */
@@ -260,6 +265,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 goto except;
             }
             emu->rf.fregs[inst->rd] = fp32_box(b32);
+            csr_fpu_dirty(&emu->csr);
             break;
         }
 
@@ -277,6 +283,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
+            csr_fpu_dirty(&emu->csr);
             break;
         }
 
@@ -333,6 +340,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== FSW / FSD (v0.8 / v0.9) ===================== */
     case OP_STORE_FP:
+        if (!csr_fpu_enabled(&emu->csr)) {
+            fault_cause = EXC_ILLEGAL_INST;
+            goto except;
+        }
         addr = rs1_val + inst->imm;
 
         if (inst->funct3 == 2u) {           /* FSW: 只写低 32 位 */
@@ -353,6 +364,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             if (emu->reservation_valid && emu->reservation_addr == pa) {
                 emu->reservation_valid = 0;
             }
+            csr_fpu_dirty(&emu->csr);
             break;
         }
 
@@ -373,6 +385,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             if (emu->reservation_valid && emu->reservation_addr == pa) {
                 emu->reservation_valid = 0;
             }
+            csr_fpu_dirty(&emu->csr);
             break;
         }
 
@@ -384,9 +397,14 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     case OP_FNMSUB:
     case OP_FNMADD:
     case OP_FP:
+        if (!csr_fpu_enabled(&emu->csr)) {
+            fault_cause = EXC_ILLEGAL_INST;
+            goto except;
+        }
         if (!fpu_execute(emu, inst)) {
             goto unknown;
         }
+        csr_fpu_dirty(&emu->csr);
         break;
 
     /* ===================== RV32A 原子指令 =====================
@@ -660,6 +678,15 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             /* CSR 指令 */
             u32 csr_addr = inst->imm;  /* CSR 地址在 imm 字段 */
             u32 csr_val, wdata;
+            int csr_wr;
+
+            /* v0.11: FS=Off 时 fflags/frm/fcsr 不可读写 */
+            if ((csr_addr == CSR_FFLAGS || csr_addr == CSR_FRM ||
+                 csr_addr == CSR_FCSR) &&
+                !csr_fpu_enabled(&emu->csr)) {
+                fault_cause = EXC_ILLEGAL_INST;
+                goto except;
+            }
 
             /*
              * v0.5: 按 CSR 地址里的最低特权级判断, 不再一刀切要求 M。
@@ -712,6 +739,20 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             if (!ok) {
                 fault_cause = EXC_ILLEGAL_INST;   /* 不存在的 CSR 属于非法指令 */
                 goto except;
+            }
+
+            /*
+             * 写浮点 CSR (fflags/frm/fcsr) 也算"动过浮点状态",
+             * FS 变成 Dirty。只读的 CSRRS/CSRRC 且 rs1=0 不算写。
+             */
+            csr_wr = (inst->funct3 == F3_CSRRW ||
+                      inst->funct3 == F3_CSRRWI ||
+                      ((inst->funct3 == F3_CSRRS || inst->funct3 == F3_CSRRC ||
+                        inst->funct3 == F3_CSRRSI || inst->funct3 == F3_CSRRCI) &&
+                       inst->rs1 != 0));
+            if (csr_wr && (csr_addr == CSR_FFLAGS || csr_addr == CSR_FRM ||
+                           csr_addr == CSR_FCSR)) {
+                csr_fpu_dirty(&emu->csr);
             }
 
             /* 回写旧 CSR 值到 rd（rd=x0 则丢弃） */
@@ -1122,6 +1163,78 @@ void execute_selftest(void)
         CHECK(mem_val == 7, "mem[0x100] = 7");
     }
     emu_free(&emu);
+
+    /* ==================== mstatus.FS (v0.11) ==================== */
+    printf("── mstatus.FS (FP enable) ──\n");
+    {
+        u32 fadd   = (0x00u << 25) | (3u << 20) | (2u << 15) |
+                     (0u << 12) | (1u << 7) | 0x53u;    /* fadd.s f1,f2,f3 */
+        u32 csr_rd = (0x003u << 20) | (0u << 15) | (2u << 12) |
+                     (1u << 7) | 0x73u;                 /* csrrs x1,fcsr,x0 */
+        u32 csr_wr = (0x003u << 20) | (1u << 15) | (5u << 12) |
+                     (0u << 7) | 0x73u;                 /* csrrwi x0,fcsr,1 */
+        bool ok2;
+
+        emu_init(&emu, MEM_SIZE);
+        emu.state = EMU_RUNNING;
+        emu.csr.mtvec = 0x100;
+        emu.rf.fregs[2] = fp32_box(0x3F800000u);    /* 1.0 */
+        emu.rf.fregs[3] = fp32_box(0x40000000u);    /* 2.0 */
+
+        /* FS=Off: FP 运算非法 */
+        emu.csr.mstatus &= ~MSTATUS_FS_MASK;
+        mem_write_inst(&emu.mem, base, fadd);
+        emu.rf.pc = base;
+        emu_run(&emu, 1);
+        CHECK(emu.csr.mcause == EXC_ILLEGAL_INST,
+              "FS=Off: fadd traps (cause=2)");
+        CHECK(emu.csr.mtval == fadd, "FS=Off: mtval = instruction bits");
+        CHECK(emu.csr.mepc == base, "FS=Off: mepc = faulting pc");
+        CHECK(emu.rf.pc == 0x100, "FS=Off: pc jumps to mtvec");
+        CHECK(emu.rf.fregs[1] == 0, "FS=Off: f1 not written");
+
+        /* FS=Off: 读 fcsr 也非法 */
+        mem_write_inst(&emu.mem, base, csr_rd);
+        emu.rf.pc = base;
+        emu_run(&emu, 1);
+        CHECK(emu.csr.mcause == EXC_ILLEGAL_INST,
+              "FS=Off: csrrs fcsr traps");
+        CHECK(emu.csr.mtval == csr_rd,
+              "FS=Off: mtval = CSR instruction bits");
+
+        /* FS=Initial: fadd 正常执行, FS 变 Dirty */
+        emu.csr.mstatus = (emu.csr.mstatus & ~MSTATUS_FS_MASK) |
+                          MSTATUS_FS_INITIAL;
+        mem_write_inst(&emu.mem, base, fadd);
+        emu.rf.pc = base;
+        emu_run(&emu, 1);
+        CHECK(emu.rf.fregs[1] == fp32_box(0x40400000u),
+              "FS=Initial: fadd 1.0+2.0 = 3.0");
+        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
+              "FS=Initial -> Dirty after FP instruction");
+
+        /* 读 fcsr 不算写, FS 保持 Initial */
+        emu.csr.mstatus = (emu.csr.mstatus & ~MSTATUS_FS_MASK) |
+                          MSTATUS_FS_INITIAL;
+        mem_write_inst(&emu.mem, base, csr_rd);
+        emu.rf.pc = base;
+        emu_run(&emu, 1);
+        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_INITIAL,
+              "read fcsr keeps FS = Initial");
+
+        /* 写 fcsr → Dirty */
+        mem_write_inst(&emu.mem, base, csr_wr);
+        emu.rf.pc = base;
+        emu_run(&emu, 1);
+        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
+              "write fcsr sets FS = Dirty");
+
+        /* sstatus 能看到 FS */
+        CHECK((csr_read(&emu.csr, CSR_SSTATUS, &ok2) & MSTATUS_FS_MASK) ==
+              (emu.csr.mstatus & MSTATUS_FS_MASK),
+              "sstatus exposes FS bits");
+        emu_free(&emu);
+    }
 
     /* ==================== 结果汇总 ==================== */
     printf("\n╔══════════════════════════════════════════════════════════╗\n");

@@ -115,11 +115,12 @@ bool csr_writable(u32 addr)
 void csr_dump(csr_t *csr)
 {
     printf("CSR:\n");
-    printf("  mstatus  = 0x%08X  (MIE=%u MPIE=%u MPP=%u)\n",
+    printf("  mstatus  = 0x%08X  (MIE=%u MPIE=%u MPP=%u FS=%u)\n",
            csr->mstatus,
            (csr->mstatus & MSTATUS_MIE) ? 1u : 0u,
            (csr->mstatus & MSTATUS_MPIE) ? 1u : 0u,
-           (csr->mstatus & MSTATUS_MPP_MASK) >> 11);
+           (csr->mstatus & MSTATUS_MPP_MASK) >> 11,
+           (csr->mstatus & MSTATUS_FS_MASK) >> MSTATUS_FS_SHIFT);
     printf("  satp     = 0x%08X  (mode=%s root=0x%X)\n",
            csr->satp,
            (csr->satp & 0x80000000u) ? "Sv32" : "bare",
@@ -131,12 +132,13 @@ void csr_dump(csr_t *csr)
     printf("  mtval    = 0x%08X\n", csr->mtval);
     printf("  mie/mip  = 0x%08X / 0x%08X\n", csr->mie, csr->mip);
     printf("  mcycle   = %llu\n",   (unsigned long long)csr->mcycle);
-    printf("  S-mode: sstatus=0x%08X (SIE=%u SPIE=%u SPP=%u SUM=%u)\n",
+    printf("  S-mode: sstatus=0x%08X (SIE=%u SPIE=%u SPP=%u SUM=%u FS=%u)\n",
            csr->mstatus & SSTATUS_MASK,
            (csr->mstatus & MSTATUS_SIE) ? 1u : 0u,
            (csr->mstatus & MSTATUS_SPIE) ? 1u : 0u,
            (csr->mstatus & MSTATUS_SPP) ? 1u : 0u,
-           (csr->mstatus & MSTATUS_SUM) ? 1u : 0u);
+           (csr->mstatus & MSTATUS_SUM) ? 1u : 0u,
+           (csr->mstatus & MSTATUS_FS_MASK) >> MSTATUS_FS_SHIFT);
     printf("  stvec    = 0x%08X  sepc = 0x%08X  scause = 0x%08X  stval = 0x%08X\n",
            csr->stvec, csr->sepc, csr->scause, csr->stval);
     printf("  medeleg  = 0x%08X  mideleg = 0x%08X\n",

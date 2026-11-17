@@ -59,7 +59,7 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.9                 │\n");
+    printf("│  RV32I Emulator v0.11                │\n");
     printf("│  RV32IMAFC + D + Sv32 + S/U-mode     │\n");
     printf("└──────────────────────────────────────┘\n\n");
 

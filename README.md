@@ -16,18 +16,19 @@
 - **融合乘加 FMA** — fmadd/fmsub/fnmsub/fnmadd 的 `.s` 和 `.d` 两种格式；四种形式化成 `fma(a', b, c')`，宿主 `fmaf/fma` 保证只舍入一次。符号变换作用在输入端而不是结果端，避免 RDN/RUP 下"舍入后取反"出错
 - **RV32D 双精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.d/fcvt.wu.d/fcvt.d.w/fcvt.d.wu、fcvt.s.d/fcvt.d.s、fclass.d、fld/fsd；FLEN 从 32 扩到 64，单精度值按 NaN-box 规则存高半字全 1
 - **RV32F 单精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.s/fcvt.wu.s/fcvt.s.w/fcvt.s.wu、fmv.x.w/fmv.w.x/fclass、flw/fsw；fflags/frm/fcsr 三个 CSR，舍入和异常标志走宿主 fenv
+- **mstatus.FS 浮点状态** — FS[14:13] 的 Off/Initial/Clean/Dirty 四态：Off 时任何 FP 指令（含 flw/fsw/fld/fsd）和 fflags/frm/fcsr 访问都按非法指令陷入；FS 非零时执行 FP 指令或写浮点 CSR 自动置 Dirty；sstatus 里能看到同一组位，S 态软件也能开关浮点
 - **RV32C 压缩指令** — 16 位指令先展开成等价的 32 位指令，再复用 RV32I 的执行路径；覆盖 c.addi/c.li/c.lui/c.addi4spn/c.addi16sp、c.lw/c.sw/c.lwsp/c.swsp、c.slli/c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and、c.beqz/c.bnez/c.j/c.jal/c.jr/c.jalr/c.mv/c.add/c.ebreak；取指按 2 字节对齐，`jal/jalr` 的链接值也是 pc+2
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
 - **系统调用** — `ecall` 按 a7 分发（exit / write），接近 RISC-V Linux ABI
 - **交互式调试器** — 单步、继续、断点、寄存器、内存、反汇编；能识别 16 位压缩指令，反汇编时标 `[c]` 并按 2 字节步进
-- **CSR** — mstatus/mie/mtvec/mscratch/mepc/mcause/mtval/mip/mcycle
+- **CSR** — mstatus/mie/mtvec/mscratch/mepc/mcause/mtval/mip/mcycle/fcsr/fflags/frm
 - **trap 框架** — 异常（ecall / 非法指令 / 访存错误 / 非对齐）和中断（机器定时器）统一进入 mtvec，`mret` 返回
 - **Sv32 分页** — 两级页表（4KB 页 + 4MB 大页）、satp、PTE 权限位（V/R/W/X/U/A/D）、取指/读/写三类缺页（mcause 12/13/15）
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
 - **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 53 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 285 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 297 项，`make test` 全过
 
 ## 快速开始
 
@@ -63,6 +64,9 @@ make f-demo
 
 # RV32D demo：双精度加减乘除、开方、转换、融合乘加、64 位内存往返
 make d-demo
+
+# mstatus.FS demo：关闭浮点 → 非法指令；开启 → 执行后变 Dirty
+make fs-demo
 
 # 在调试器里打开同一个程序
 make debug-demo

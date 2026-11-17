@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo
 
 all: $(TARGET)
 
@@ -83,6 +83,12 @@ d-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_d_demo.py $(BUILDDIR)/d_demo.elf
 	$(TARGET) $(BUILDDIR)/d_demo.elf
+
+# mstatus.FS demo: 关闭浮点 → 非法指令; 开启 → 执行后变 Dirty
+fs-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_fs_demo.py $(BUILDDIR)/fs_demo.elf
+	$(TARGET) $(BUILDDIR)/fs_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)
