@@ -2,7 +2,7 @@
  * @file    emu.c
  * @brief   RV32I Emulator — 顶层模拟器实现
  *
- * fetch-decode-execute 主循环。
+ * fetch-decode-execute 主循环 + 多 hart 轮转调度。
  */
 
 #include "emu.h"
@@ -13,23 +13,60 @@
 #include <stdio.h>
 #include <string.h>
 
+/* =========================== 初始化 =========================== */
+
+/**
+ * @brief 复位一个 hart
+ *
+ * 真实 CPU 复位后所有 hart 都从同一个复位向量开始跑, 固件读
+ * mhartid 决定自己是谁。这里保持一样的行为: 每个 hart 都复位
+ * 进 M 态, mhartid 写入编号, pc 等加载 ELF 时再统一设置。
+ */
+static void hart_reset(hart_t *h, u32 hartid)
+{
+    regfile_init(&h->rf);
+    csr_init(&h->csr);
+
+    h->csr.mhartid = hartid;
+    h->csr.mstatus = MSTATUS_FS_INITIAL;    /* v0.11: 复位后浮点可用 */
+
+    h->priv              = PRIV_M;
+    h->reservation_valid = 0;
+    h->reservation_addr  = 0;
+    h->mtimecmp          = 0;               /* 0 = 定时器关闭 */
+    h->state             = EMU_HALTED;
+}
+
+void emu_init_harts(emulator_t *emu, u32 nharts)
+{
+    u32 i;
+
+    if (nharts == 0) nharts = 1;
+    if (nharts > MAX_HARTS) nharts = MAX_HARTS;
+
+    for (i = 0; i < nharts; i++) {
+        hart_reset(&emu->harts[i], i);
+    }
+    for (i = nharts; i < MAX_HARTS; i++) {
+        memset(&emu->harts[i], 0, sizeof(emu->harts[i]));
+        emu->harts[i].state = EMU_HALTED;
+    }
+
+    emu->nharts = nharts;
+    emu->cur    = 0;
+}
+
 void emu_init(emulator_t *emu, u32 mem_size)
 {
     (void)mem_size;  /* 当前使用 memory.h 中的固定 MEM_SIZE */
 
     memory_init(&emu->mem);
-    regfile_init(&emu->rf);
-    csr_init(&emu->csr);
-    trap_init(emu);
 
-    emu->priv = PRIV_M;         /* 复位进 M 态 */
-
-    emu->reservation_valid = 0; /* RV32A: 复位后没有 LR 保留 */
-    emu->reservation_addr  = 0;
-
-    emu->state     = EMU_HALTED;
+    emu->mtime     = 0;
     emu->entry     = 0;
     emu->exit_code = 0;
+
+    emu_init_harts(emu, 1);
 }
 
 void emu_free(emulator_t *emu)
@@ -37,18 +74,27 @@ void emu_free(emulator_t *emu)
     memory_free(&emu->mem);
 }
 
+/* =========================== ELF =========================== */
+
 bool emu_load_elf(emulator_t *emu, const char *path)
 {
     elf_info_t info;
     u32 entry = elf_load(path, &emu->mem, &info);
+    u32 i;
+
     if (entry == 0) return false;
 
     emu->entry     = entry;
-    emu->rf.pc     = entry;
-    emu->state     = EMU_RUNNING;
     emu->exit_code = 0;
 
-    printf("[EMU] pc set to entry = 0x%08X\n", entry);
+    /* 所有 hart 从同一个入口开始执行 */
+    for (i = 0; i < emu->nharts; i++) {
+        emu->harts[i].rf.pc = entry;
+        emu->harts[i].state = EMU_RUNNING;
+    }
+
+    printf("[EMU] pc set to entry = 0x%08X  (%u hart%s)\n",
+           entry, emu->nharts, emu->nharts > 1 ? "s" : "");
     printf("[EMU] .text: [0x%08X — 0x%08X]\n", info.text_start, info.text_end);
     if (info.data_start != 0xFFFFFFFF) {
         printf("[EMU] .data: [0x%08X — 0x%08X]\n", info.data_start, info.data_end);
@@ -59,45 +105,70 @@ bool emu_load_elf(emulator_t *emu, const char *path)
     return true;
 }
 
+/* =========================== 执行 =========================== */
+
 u64 emu_run(emulator_t *emu, u64 max_steps)
 {
     u64 steps = 0;
     decoded_inst_t inst;
+    bool any;
+    u32 i;
 
-    while (emu->state == EMU_RUNNING) {
-        if (max_steps > 0 && steps >= max_steps) break;
-        if (!emu_step(emu, &inst)) break;
-        steps++;
-    }
+    /*
+     * 轮转调度: 一轮里每个还活着的 hart 各执行一条指令。
+     *
+     * 真硬件是并行跑的, 但模拟器里所有 hart 串行执行, 指令之间
+     * 严格按这个轮转顺序交错。对单 hart 程序完全没有影响; 对双核
+     * 程序来说, 交错顺序是确定的, demo 因此可以重复验证。
+     */
+    do {
+        for (i = 0; i < emu->nharts; i++) {
+            if (emu->harts[i].state != EMU_RUNNING) continue;
+            if (max_steps > 0 && steps >= max_steps) return steps;
+
+            emu->cur = i;
+            emu_step(emu, &inst);
+            steps++;
+        }
+
+        any = false;
+        for (i = 0; i < emu->nharts; i++) {
+            if (emu->harts[i].state == EMU_RUNNING) {
+                any = true;
+                break;
+            }
+        }
+    } while (any && (max_steps == 0 || steps < max_steps));
 
     return steps;
 }
 
 bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 {
+    hart_t *h = emu_hart(emu);
     u32 raw;
     bool compressed = false;
-    u32 pc = emu->rf.pc;
+    u32 pc = h->rf.pc;
 
     /*
      * 0. 指令边界上检查定时器中断。
      *
      * 中断是异步的, 只能在两条指令之间进来。trap_check_interrupt
-     * 顺便把 mtime 往前推一格。
+     * 顺便把全机器共享的 mtime 往前推一格。
      */
     if (trap_check_interrupt(emu, pc)) {
-        emu->csr.mcycle++;
+        h->csr.mcycle++;
         return true;            /* 这一"步"没有执行指令, 但跳进了 handler */
     }
 
     /* 1. Fetch: 取出 16-bit 或 32-bit 指令 (RV32C 允许 2 字节对齐) */
     if ((pc & 1u) != 0) {
         if (trap_raise(emu, EXC_INST_MISALIGNED, pc, pc)) {
-            emu->csr.mcycle++;
+            h->csr.mcycle++;
             return true;
         }
         printf("[EMU] misaligned pc=0x%08X\n", pc);
-        emu->state = EMU_EXCEPTION;
+        h->state = EMU_EXCEPTION;
         return false;
     }
 
@@ -115,11 +186,11 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 
         if (frc != 0) {
             if (trap_raise(emu, (u32)frc, pc, pc)) {
-                emu->csr.mcycle++;
+                h->csr.mcycle++;
                 return true;
             }
             printf("[EMU] fetch page fault at pc=0x%08X\n", pc);
-            emu->state = EMU_EXCEPTION;
+            h->state = EMU_EXCEPTION;
             return false;
         }
 
@@ -129,22 +200,22 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
          */
         if (!memory_read16(&emu->mem, fetch_pa, &lo)) {
             if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
-                emu->csr.mcycle++;
+                h->csr.mcycle++;
                 return true;
             }
             printf("[EMU] fetch failed at pc=0x%08X\n", pc);
-            emu->state = EMU_EXCEPTION;
+            h->state = EMU_EXCEPTION;
             return false;
         }
 
         if ((lo & 3u) != 3u) {
             if (!expand_compressed(lo, &raw)) {
                 if (trap_raise(emu, EXC_ILLEGAL_INST, lo, pc)) {
-                    emu->csr.mcycle++;
+                    h->csr.mcycle++;
                     return true;
                 }
                 printf("[EMU] bad compressed inst 0x%04X at pc=0x%08X\n", lo, pc);
-                emu->state = EMU_EXCEPTION;
+                h->state = EMU_EXCEPTION;
                 return false;
             }
             compressed = true;
@@ -168,11 +239,11 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 
             if (!fetch_ok) {
                 if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
-                    emu->csr.mcycle++;
+                    h->csr.mcycle++;
                     return true;
                 }
                 printf("[EMU] fetch failed at pc=0x%08X\n", pc);
-                emu->state = EMU_EXCEPTION;
+                h->state = EMU_EXCEPTION;
                 return false;
             }
         }
@@ -181,11 +252,11 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
     /* 2. Decode */
     if (!decode(raw, inst_out)) {
         if (trap_raise(emu, EXC_ILLEGAL_INST, raw, pc)) {
-            emu->csr.mcycle++;
+            h->csr.mcycle++;
             return true;
         }
         printf("[EMU] decode failed at pc=0x%08X raw=0x%08X\n", pc, raw);
-        emu->state = EMU_EXCEPTION;
+        h->state = EMU_EXCEPTION;
         return false;
     }
 
@@ -200,20 +271,240 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
     }
 
     /* 4. 周期计数 */
-    emu->csr.mcycle++;
+    h->csr.mcycle++;
 
     return true;
 }
 
+/* =========================== 自测 =========================== */
+
+static u32 enc_i(s32 imm, u32 rs1, u32 f3, u32 rd, u32 op)
+{
+    return ((u32)imm & 0xFFFu) << 20 | (rs1 & 0x1Fu) << 15 |
+           (f3 & 7u) << 12 | (rd & 0x1Fu) << 7 | (op & 0x7Fu);
+}
+
+static u32 enc_s(s32 imm, u32 rs2, u32 rs1, u32 f3)
+{
+    u32 u = (u32)imm;
+    return ((u >> 5) & 0x7Fu) << 25 | (rs2 & 0x1Fu) << 20 |
+           (rs1 & 0x1Fu) << 15 | (f3 & 7u) << 12 |
+           (u & 0x1Fu) << 7 | 0x23u;
+}
+
+static u32 enc_b(s32 imm, u32 rs2, u32 rs1, u32 f3)
+{
+    u32 u = (u32)imm;
+    return ((u >> 12) & 1u) << 31 | ((u >> 5) & 0x3Fu) << 25 |
+           (rs2 & 0x1Fu) << 20 | (rs1 & 0x1Fu) << 15 |
+           (f3 & 7u) << 12 | ((u >> 1) & 0xFu) << 8 |
+           ((u >> 11) & 1u) << 7 | 0x63u;
+}
+
+static u32 enc_amo(u32 f5, u32 rs2, u32 rs1, u32 rd)
+{
+    return (f5 & 0x1Fu) << 27 | (rs2 & 0x1Fu) << 20 |
+           (rs1 & 0x1Fu) << 15 | 2u << 12 | (rd & 0x1Fu) << 7 | 0x2Fu;
+}
+
+static void put32(emulator_t *emu, u32 addr, u32 val)
+{
+    memory_write32(&emu->mem, addr, val);
+}
+
+#define MH_CHECK(cond, name) do { \
+    if (!(cond)) { \
+        printf("  [FAIL] %s\n", name); \
+        fail++; \
+    } else { \
+        printf("  [OK]   %s\n", name); \
+        pass++; \
+    } \
+} while (0)
+
+void emu_selftest(void)
+{
+    emulator_t emu;
+    decoded_inst_t inst;
+    hart_t *h0, *h1;
+    u32 v;
+    int pass = 0, fail = 0;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        Multi-Hart Self-Test (v0.12)                      ║\n");
+    printf("║        mhartid / per-hart CSR / shared memory / LR-SC    ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    /* ---------- 1. 复位状态 ---------- */
+    printf("── reset state ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h0 = &emu.harts[0];
+    h1 = &emu.harts[1];
+
+    MH_CHECK(emu.nharts == 2, "nharts = 2");
+    MH_CHECK(h0->csr.mhartid == 0 && h1->csr.mhartid == 1,
+             "mhartid = 0 / 1");
+    MH_CHECK(h0->priv == PRIV_M && h1->priv == PRIV_M,
+             "both harts reset to M-mode");
+    MH_CHECK(h0->state == EMU_HALTED && h1->state == EMU_HALTED,
+             "both harts start halted");
+
+    /* ---------- 2. 读 mhartid CSR ---------- */
+    printf("\n── csrr mhartid ──\n");
+    /* csrrs x5, mhartid, x0 */
+    put32(&emu, 0x100, enc_i((s32)CSR_MHARTID, 0, 2, 5, 0x73));
+
+    h0->state = EMU_RUNNING;
+    h0->rf.pc = 0x100;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+    MH_CHECK(h0->rf.regs[5] == 0, "hart0 reads mhartid = 0");
+
+    h1->state = EMU_RUNNING;
+    h1->rf.pc = 0x100;
+    emu.cur = 1;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.regs[5] == 1, "hart1 reads mhartid = 1");
+
+    /* ---------- 3. CSR 各自独立 ---------- */
+    printf("\n── per-hart CSR ──\n");
+    /* csrrw x0, mtvec, x1 */
+    put32(&emu, 0x110, enc_i((s32)CSR_MTVEC, 1, 1, 0, 0x73));
+    h1->rf.regs[1] = 0x800;
+    h1->rf.pc = 0x110;
+    emu.cur = 1;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->csr.mtvec == 0x800, "hart1 mtvec = 0x800");
+    MH_CHECK(h0->csr.mtvec == 0, "hart0 mtvec untouched");
+
+    /* ---------- 4. 共享内存 ---------- */
+    printf("\n── shared memory ──\n");
+    /* sw x2, 0(x1) —— hart0 写到 0x200 */
+    put32(&emu, 0x120, enc_s(0, 2, 1, 2));
+    h0->rf.regs[1] = 0x200;
+    h0->rf.regs[2] = 0x12345678;
+    h0->rf.pc = 0x120;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+
+    /* lw x3, 0(x1) —— hart1 读同一个地址 */
+    put32(&emu, 0x130, enc_i(0, 1, 2, 3, 0x03));
+    h1->rf.regs[1] = 0x200;
+    h1->rf.pc = 0x130;
+    emu.cur = 1;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.regs[3] == 0x12345678, "hart1 sees hart0's store");
+
+    /* ---------- 5. 跨 hart LR/SC ---------- */
+    printf("\n── cross-hart LR/SC ──\n");
+    /* lr.w x2, (x1) */
+    put32(&emu, 0x140, enc_amo(0x02, 0, 1, 2));
+    /* sc.w x3, x2, (x1) */
+    put32(&emu, 0x160, enc_amo(0x03, 2, 1, 3));
+    /* sw x4, 0(x1) */
+    put32(&emu, 0x150, enc_s(0, 4, 1, 2));
+
+    h0->rf.regs[1] = 0x200;
+    h0->rf.pc = 0x140;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+    MH_CHECK(h0->reservation_valid && h0->reservation_addr == 0x200,
+             "hart0 LR sets reservation");
+
+    /* hart1 写到同一地址 → 保留失效 */
+    h1->rf.regs[1] = 0x200;
+    h1->rf.regs[4] = 99;
+    h1->rf.pc = 0x150;
+    emu.cur = 1;
+    emu_step(&emu, &inst);
+    MH_CHECK(h0->reservation_valid == 0,
+             "hart1 store invalidates hart0 reservation");
+
+    h0->rf.regs[2] = 7;
+    h0->rf.pc = 0x160;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+    MH_CHECK(h0->rf.regs[3] == 1, "SC fails after cross-hart write");
+    memory_read32(&emu.mem, 0x200, &v);
+    MH_CHECK(v == 99, "memory keeps hart1's value");
+
+    /* 没有干扰时 SC 成功 */
+    h0->rf.pc = 0x140;
+    emu_step(&emu, &inst);          /* LR: x2 ← 内存里的 99 */
+    h0->rf.regs[2] = 7;             /* 软件算出新值 */
+    h0->rf.pc = 0x160;
+    emu_step(&emu, &inst);          /* SC */
+    MH_CHECK(h0->rf.regs[3] == 0, "SC succeeds when reservation intact");
+    memory_read32(&emu.mem, 0x200, &v);
+    MH_CHECK(v == 7, "memory now holds hart0's value");
+
+    /* ---------- 6. 每个 hart 自己的 mtimecmp ---------- */
+    printf("\n── per-hart mtimecmp ──\n");
+    /* hart0 写 hart1 的比较值: lui x1, 0x02004; addi x1,x1,8; sw x2,0(x1) */
+    put32(&emu, 0x170, 0x020040B7u);                    /* lui  x1, 0x02004 */
+    put32(&emu, 0x174, enc_i(8, 1, 0, 1, 0x13));        /* addi x1, x1, 8  */
+    put32(&emu, 0x178, enc_s(0, 2, 1, 2));              /* sw   x2, 0(x1)  */
+    h0->rf.regs[2] = 123;
+    h0->rf.pc = 0x170;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->mtimecmp == 123, "writing 0x02004008 sets hart1's mtimecmp");
+    MH_CHECK(h0->mtimecmp == 0, "hart0's mtimecmp untouched");
+
+    /* ---------- 7. 轮转调度 + 原子计数 ---------- */
+    printf("\n── round-robin: two harts count to 10 ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h0 = &emu.harts[0];
+    h1 = &emu.harts[1];
+
+    put32(&emu, 0x100, enc_i(0x200, 0, 0, 1, 0x13));    /* addi x1, x0, 0x200 */
+    put32(&emu, 0x104, enc_i(5, 0, 0, 2, 0x13));        /* addi x2, x0, 5     */
+    put32(&emu, 0x108, enc_i(1, 0, 0, 3, 0x13));        /* addi x3, x0, 1     */
+    put32(&emu, 0x10C, enc_amo(0x00, 3, 1, 0));         /* amoadd.w x0,x3,(x1)*/
+    put32(&emu, 0x110, enc_i(-1, 2, 0, 2, 0x13));       /* addi x2, x2, -1    */
+    put32(&emu, 0x114, enc_b(-8, 0, 2, 1));             /* bnez x2, 0x10C     */
+    put32(&emu, 0x118, 0x00000073u);                    /* ecall (exit)       */
+
+    h0->rf.pc = 0x100; h0->state = EMU_RUNNING;
+    h1->rf.pc = 0x100; h1->state = EMU_RUNNING;
+
+    {
+        u64 steps = emu_run(&emu, 0);
+        memory_read32(&emu.mem, 0x200, &v);
+        MH_CHECK(v == 10, "counter = 10 (5 + 5 atomic adds)");
+        MH_CHECK(steps == 38, "19 instructions per hart, round-robin");
+        MH_CHECK(h0->state == EMU_HALTED && h1->state == EMU_HALTED,
+                 "both harts halted");
+    }
+
+    printf("\n  Result: %d passed, %d failed\n", pass, fail);
+    emu_free(&emu);
+}
+
 void emu_dump_state(emulator_t *emu)
 {
-    printf("\n=== Emulator State ===\n");
-    printf("  state = %d\n", emu->state);
-    printf("  pc    = 0x%08X\n", emu->rf.pc);
-    if (emu->state == EMU_HALTED) {
-        printf("  exit_code = %u\n", emu->exit_code);
+    u32 i;
+
+    printf("\n=== Emulator State (%u hart%s) ===\n",
+           emu->nharts, emu->nharts > 1 ? "s" : "");
+    printf("  mtime = %llu\n", (unsigned long long)emu->mtime);
+
+    for (i = 0; i < emu->nharts; i++) {
+        hart_t *h = &emu->harts[i];
+
+        printf("\n--- hart %u ---\n", i);
+        printf("  state = %d\n", h->state);
+        printf("  pc    = 0x%08X\n", h->rf.pc);
+        if (h->state == EMU_HALTED) {
+            printf("  exit_code = %u\n", emu->exit_code);
+        }
+        regfile_dump(&h->rf);
+        regfile_dump_f(&h->rf);
+        csr_dump(&h->csr);
     }
-    regfile_dump(&emu->rf);
-    regfile_dump_f(&emu->rf);
-    csr_dump(&emu->csr);
 }

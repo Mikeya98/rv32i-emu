@@ -350,17 +350,19 @@ static int rvc_failed = 0;
 
 static void rvc_load(emulator_t *emu, u32 addr, const u16 *code, u32 n)
 {
+    hart_t *h = emu_hart(emu);
     u32 i;
     for (i = 0; i < n; i++) {
         memory_write16(&emu->mem, addr + i * 2u, code[i]);
     }
-    emu->rf.pc = addr;
-    emu->state = EMU_RUNNING;
+    h->rf.pc = addr;
+    h->state = EMU_RUNNING;
 }
 
 void rvc_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     const u32 base = 0x1000;
 
     printf("\n");
@@ -407,8 +409,8 @@ void rvc_selftest(void)
         const u16 code[] = { 0x4515, 0x0505, 0x050A, 0x9002 };
         rvc_load(&emu, base, code, 4);
         emu_run(&emu, 10);
-        RVC_CHECK(reg_read(&emu.rf, 10) == 24u, "a0 == (5+1)<<2 == 24");
-        RVC_CHECK(emu.state == EMU_HALTED, "ebreak halted");
+        RVC_CHECK(reg_read(&h->rf, 10) == 24u, "a0 == (5+1)<<2 == 24");
+        RVC_CHECK(h->state == EMU_HALTED, "ebreak halted");
     }
 
     /* ---------------- 执行: 压缩 load/store ---------------- */
@@ -420,7 +422,7 @@ void rvc_selftest(void)
         const u16 code[] = { 0x6445, 0x44D5, 0xC004, 0x4008, 0x9002 };
         rvc_load(&emu, base, code, 5);
         emu_run(&emu, 10);
-        RVC_CHECK(reg_read(&emu.rf, 10) == 21u, "c.lw loaded 21");  /* rd=x10 */
+        RVC_CHECK(reg_read(&h->rf, 10) == 21u, "c.lw loaded 21");  /* rd=x10 */
         {
             u32 v = 0;
             memory_read32(&emu.mem, 0x11000u, &v);
@@ -443,8 +445,8 @@ void rvc_selftest(void)
         };
         rvc_load(&emu, base, code, 6);
         emu_run(&emu, 20);
-        RVC_CHECK(reg_read(&emu.rf, 11) == 0u, "branch taken, a1 untouched");
-        RVC_CHECK(reg_read(&emu.rf, 12) == 9u, "a2 == 9 after branch");
+        RVC_CHECK(reg_read(&h->rf, 11) == 0u, "branch taken, a1 untouched");
+        RVC_CHECK(reg_read(&h->rf, 12) == 9u, "a2 == 9 after branch");
     }
 
     /* ---------------- 执行: 跳转与链接 ---------------- */
@@ -455,7 +457,7 @@ void rvc_selftest(void)
         const u16 code[] = { 0x2011, 0x9002 };
         rvc_load(&emu, base, code, 2);
         emu_run(&emu, 5);
-        RVC_CHECK(reg_read(&emu.rf, 1) == 0x1002u, "c.jal links pc+2");
+        RVC_CHECK(reg_read(&h->rf, 1) == 0x1002u, "c.jal links pc+2");
     }
 
     emu_init(&emu, MEM_SIZE);
@@ -464,7 +466,7 @@ void rvc_selftest(void)
         const u16 code[] = { 0x6505, 0x0519, 0x9502, 0x9002 };
         rvc_load(&emu, base, code, 4);
         emu_run(&emu, 10);
-        RVC_CHECK(reg_read(&emu.rf, 1) == 0x1006u, "c.jalr links pc+2");
+        RVC_CHECK(reg_read(&h->rf, 1) == 0x1006u, "c.jalr links pc+2");
     }
 
     /* ---------------- 非法/保留编码 ---------------- */

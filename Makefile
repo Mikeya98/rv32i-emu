@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo
 
 all: $(TARGET)
 
@@ -89,6 +89,12 @@ fs-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_fs_demo.py $(BUILDDIR)/fs_demo.elf
 	$(TARGET) $(BUILDDIR)/fs_demo.elf
+
+# 双 hart demo: 两个核从同一入口启动, 按 mhartid 分流, AMO 共享计数
+multihart-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_multihart_demo.py $(BUILDDIR)/mh_demo.elf
+	$(TARGET) --harts 2 $(BUILDDIR)/mh_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

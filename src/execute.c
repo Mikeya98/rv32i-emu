@@ -56,15 +56,38 @@ static u32 rv_remu(u32 a, u32 b)
     return (b == 0) ? a : (a % b);
 }
 
+/* =========================== 总线 =========================== */
+
+/**
+ * @brief 一次写内存之后, 通知所有 hart
+ *
+ * LR/SC 的保留集是每个 hart 自己记录的, 但内存只有一份。别的 hart
+ * 写到了保留地址, 本 hart 的 SC 就必须失败 —— 否则双核上的
+ * "读-改-写" 会丢更新。这里在每次写入后扫一遍所有 hart 的保留集,
+ * 命中的清掉。
+ */
+static void bus_write(emulator_t *emu, u32 pa)
+{
+    u32 i;
+
+    for (i = 0; i < emu->nharts; i++) {
+        hart_t *o = &emu->harts[i];
+        if (o->reservation_valid && o->reservation_addr == pa) {
+            o->reservation_valid = 0;
+        }
+    }
+}
+
 /* =========================== 核心 =========================== */
 
 bool execute(emulator_t *emu, decoded_inst_t *inst)
 {
-    u32 pc      = emu->rf.pc;
+    hart_t *h   = emu_hart(emu);
+    u32 pc      = h->rf.pc;
     u32 ilen    = inst->len ? inst->len : 4u;   /* 压缩指令是 2 字节 */
     u32 next_pc = pc + ilen;       /* 默认顺序执行 */
-    u32 rs1_val = reg_read(&emu->rf, inst->rs1);
-    u32 rs2_val = reg_read(&emu->rf, inst->rs2);
+    u32 rs1_val = reg_read(&h->rf, inst->rs1);
+    u32 rs2_val = reg_read(&h->rf, inst->rs2);
     u32 result  = 0;
     u32 addr = 0;
     u32 pa   = 0;
@@ -109,7 +132,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             default:
                 goto unknown;
             }
-            reg_write(&emu->rf, inst->rd, result);
+            reg_write(&h->rf, inst->rd, result);
             break;
         }
 
@@ -145,7 +168,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         default:
             goto unknown;
         }
-        reg_write(&emu->rf, inst->rd, result);
+        reg_write(&h->rf, inst->rd, result);
         break;
 
     /* ===================== ALU immediate (I-type) ===================== */
@@ -180,7 +203,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         default:
             goto unknown;
         }
-        reg_write(&emu->rf, inst->rd, result);
+        reg_write(&h->rf, inst->rd, result);
         break;
 
     /* ===================== LOAD ===================== */
@@ -208,9 +231,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             goto except;
         }
 
-        /* 简化版 CLINT: mtime 低 32 位 (0x0200BFF8), 只读 */
+        /* 简化版 CLINT: mtime 全机器共享, 低/高 32 位分开读 */
         if (inst->funct3 == F3_LW && pa == CLINT_MTIME_LO) {
-            reg_write(&emu->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
+            reg_write(&h->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
+            break;
+        }
+        if (inst->funct3 == F3_LW && pa == CLINT_MTIME_HI) {
+            reg_write(&h->rf, inst->rd, (u32)(emu->mtime >> 32));
             break;
         }
 
@@ -238,13 +265,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         default:
             goto unknown;
         }
-        reg_write(&emu->rf, inst->rd, result);
+        reg_write(&h->rf, inst->rd, result);
         break;
 
     /* ===================== FLW / FLD (v0.8 / v0.9) ===================== */
     case OP_LOAD_FP:
         /* v0.11: FS=Off 时浮点 load/store 也是非法指令 */
-        if (!csr_fpu_enabled(&emu->csr)) {
+        if (!csr_fpu_enabled(&h->csr)) {
             fault_cause = EXC_ILLEGAL_INST;
             goto except;
         }
@@ -264,8 +291,8 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
-            emu->rf.fregs[inst->rd] = fp32_box(b32);
-            csr_fpu_dirty(&emu->csr);
+            h->rf.fregs[inst->rd] = fp32_box(b32);
+            csr_fpu_dirty(&h->csr);
             break;
         }
 
@@ -279,11 +306,11 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_read64(&emu->mem, pa, &emu->rf.fregs[inst->rd])) {
+            if (!memory_read64(&emu->mem, pa, &h->rf.fregs[inst->rd])) {
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
-            csr_fpu_dirty(&emu->csr);
+            csr_fpu_dirty(&h->csr);
             break;
         }
 
@@ -309,9 +336,23 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             goto except;
         }
 
-        /* 简化版 CLINT: mtimecmp 低 32 位 (0x02004000) */
-        if (inst->funct3 == F3_SW && pa == CLINT_MTIMECMP_LO) {
-            emu->mtimecmp = (emu->mtimecmp & 0xFFFFFFFF00000000ULL) | rs2_val;
+        /*
+         * 简化版 CLINT: 每个 hart 一个 64 位 mtimecmp, 相邻两个相隔
+         * 8 字节。写哪个 hart 的比较值由地址决定, 不一定是当前 hart。
+         */
+        if (inst->funct3 == F3_SW &&
+            pa >= CLINT_MTIMECMP_BASE &&
+            pa <  CLINT_MTIMECMP_BASE + 8u * MAX_HARTS) {
+            u32 off  = pa - CLINT_MTIMECMP_BASE;
+            u32 who  = off / 8u;
+            u64 cur  = emu->harts[who].mtimecmp;
+
+            if ((off & 4u) == 0) {
+                cur = (cur & 0xFFFFFFFF00000000ULL) | rs2_val;
+            } else {
+                cur = (cur & 0x00000000FFFFFFFFULL) | ((u64)rs2_val << 32);
+            }
+            emu->harts[who].mtimecmp = cur;
             break;
         }
 
@@ -332,15 +373,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             fault_cause = EXC_STORE_ACCESS;
             goto except;
         }
-        /* 普通 store 命中 LR 保留地址 → 保留失效 */
-        if (emu->reservation_valid && emu->reservation_addr == pa) {
-            emu->reservation_valid = 0;
-        }
+        /* 普通 store 命中任一 hart 的 LR 保留地址 → 保留失效 */
+        bus_write(emu, pa);
         break;
 
     /* ===================== FSW / FSD (v0.8 / v0.9) ===================== */
     case OP_STORE_FP:
-        if (!csr_fpu_enabled(&emu->csr)) {
+        if (!csr_fpu_enabled(&h->csr)) {
             fault_cause = EXC_ILLEGAL_INST;
             goto except;
         }
@@ -357,14 +396,12 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 goto except;
             }
             if (!memory_write32(&emu->mem, pa,
-                                (u32)emu->rf.fregs[inst->rs2])) {
+                                (u32)h->rf.fregs[inst->rs2])) {
                 fault_cause = EXC_STORE_ACCESS;
                 goto except;
             }
-            if (emu->reservation_valid && emu->reservation_addr == pa) {
-                emu->reservation_valid = 0;
-            }
-            csr_fpu_dirty(&emu->csr);
+            bus_write(emu, pa);
+            csr_fpu_dirty(&h->csr);
             break;
         }
 
@@ -378,14 +415,12 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_write64(&emu->mem, pa, emu->rf.fregs[inst->rs2])) {
+            if (!memory_write64(&emu->mem, pa, h->rf.fregs[inst->rs2])) {
                 fault_cause = EXC_STORE_ACCESS;
                 goto except;
             }
-            if (emu->reservation_valid && emu->reservation_addr == pa) {
-                emu->reservation_valid = 0;
-            }
-            csr_fpu_dirty(&emu->csr);
+            bus_write(emu, pa);
+            csr_fpu_dirty(&h->csr);
             break;
         }
 
@@ -397,14 +432,14 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     case OP_FNMSUB:
     case OP_FNMADD:
     case OP_FP:
-        if (!csr_fpu_enabled(&emu->csr)) {
+        if (!csr_fpu_enabled(&h->csr)) {
             fault_cause = EXC_ILLEGAL_INST;
             goto except;
         }
         if (!fpu_execute(emu, inst)) {
             goto unknown;
         }
-        csr_fpu_dirty(&emu->csr);
+        csr_fpu_dirty(&h->csr);
         break;
 
     /* ===================== RV32A 原子指令 =====================
@@ -445,9 +480,9 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
-            emu->reservation_valid = 1;
-            emu->reservation_addr  = pa;
-            reg_write(&emu->rf, inst->rd, b32);
+            h->reservation_valid = 1;
+            h->reservation_addr  = pa;
+            reg_write(&h->rf, inst->rd, b32);
             break;
         }
 
@@ -458,16 +493,17 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (emu->reservation_valid && emu->reservation_addr == pa) {
+            if (h->reservation_valid && h->reservation_addr == pa) {
                 if (!memory_write32(&emu->mem, pa, rs2_val)) {
                     fault_cause = EXC_STORE_ACCESS;
                     goto except;
                 }
-                reg_write(&emu->rf, inst->rd, 0);
+                bus_write(emu, pa);     /* 别的 hart 的保留也一起失效 */
+                reg_write(&h->rf, inst->rd, 0);
             } else {
-                reg_write(&emu->rf, inst->rd, 1);
+                reg_write(&h->rf, inst->rd, 1);
             }
-            emu->reservation_valid = 0;
+            h->reservation_valid = 0;
             break;
         }
 
@@ -504,10 +540,8 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             fault_cause = EXC_STORE_ACCESS;
             goto except;
         }
-        reg_write(&emu->rf, inst->rd, b32);
-        if (emu->reservation_valid && emu->reservation_addr == pa) {
-            emu->reservation_valid = 0;
-        }
+        reg_write(&h->rf, inst->rd, b32);
+        bus_write(emu, pa);
         break;
     }
 
@@ -531,7 +565,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== JAL ===================== */
     case OP_JAL:
-        reg_write(&emu->rf, inst->rd, pc + ilen);   /* 链接 */
+        reg_write(&h->rf, inst->rd, pc + ilen);   /* 链接 */
         next_pc = pc + inst->imm;                    /* 跳转 */
         break;
 
@@ -539,17 +573,17 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     case OP_JALR:
         result  = pc + ilen;
         next_pc = (rs1_val + inst->imm) & ~1u;    /* 最低位清零 */
-        reg_write(&emu->rf, inst->rd, result);     /* 链接 */
+        reg_write(&h->rf, inst->rd, result);     /* 链接 */
         break;
 
     /* ===================== LUI ===================== */
     case OP_LUI:
-        reg_write(&emu->rf, inst->rd, inst->imm);
+        reg_write(&h->rf, inst->rd, inst->imm);
         break;
 
     /* ===================== AUIPC ===================== */
     case OP_AUIPC:
-        reg_write(&emu->rf, inst->rd, pc + inst->imm);
+        reg_write(&h->rf, inst->rd, pc + inst->imm);
         break;
 
     /* ===================== SYSTEM ===================== */
@@ -561,7 +595,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
          */
         if (inst->raw == 0x30200073) {
             /* MRET: 从 M 态 trap handler 返回。S/U 态执行它属于非法指令 */
-            if (emu->priv != PRIV_M) {
+            if (h->priv != PRIV_M) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
@@ -571,7 +605,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * SRET (v0.5): 从 S 态 trap handler 返回。
              * S 和 M 都可以执行; U 态执行按非法指令处理。
              */
-            if (emu->priv < PRIV_S) {
+            if (h->priv < PRIV_S) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
@@ -584,7 +618,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 真正要做的事只有一件: 检查特权级。真实 CPU 上它是
              * M/S 态指令, U 态执行会陷非法指令。
              */
-            if (emu->priv < PRIV_S) {
+            if (h->priv < PRIV_S) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
@@ -595,16 +629,16 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 没装 handler 时保持 v0.2 的"宿主系统调用"约定 (exit/write),
              * 这样旧的 demo 不用改。
              */
-            if (emu->csr.mtvec != 0 || emu->csr.stvec != 0) {
+            if (h->csr.mtvec != 0 || h->csr.stvec != 0) {
                 /*
                  * v0.4/v0.5: ecall 的 cause 取决于来源特权级
                  *   M 态 → 11, S 态 → 9, U 态 → 8
                  * 如果 medeleg 对应位置 1, trap_raise 会把它转给 S 态。
                  */
-                u32 cause = (emu->priv == PRIV_M) ? EXC_ECALL_M
-                          : (emu->priv == PRIV_S) ? EXC_ECALL_S : EXC_ECALL_U;
+                u32 cause = (h->priv == PRIV_M) ? EXC_ECALL_M
+                          : (h->priv == PRIV_S) ? EXC_ECALL_S : EXC_ECALL_U;
                 if (!trap_raise(emu, cause, 0, pc)) {
-                    emu->state = EMU_EXCEPTION;
+                    h->state = EMU_EXCEPTION;
                     return false;
                 }
                 return true;        /* pc 已经被 trap_raise 改到 mtvec */
@@ -614,9 +648,9 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 没装 handler 时只有 M 态还能用宿主系统调用;
              * U 态裸跑没有意义 (没有内核可陷), 当未处理异常。
              */
-            if (emu->priv != PRIV_M) {
+            if (h->priv != PRIV_M) {
                 printf("[EXEC] ecall from U-mode without handler at pc=0x%08X\n", pc);
-                emu->state = EMU_EXCEPTION;
+                h->state = EMU_EXCEPTION;
                 return false;
             }
 
@@ -627,15 +661,15 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              *     64      write(fd, buf, len) → 直接输出到终端
              * a7=0 是为了兼容早期自测里"ecall 直接停机"的写法。
              */
-            u32 a0 = reg_read(&emu->rf, 10);
-            u32 a1 = reg_read(&emu->rf, 11);
-            u32 a2 = reg_read(&emu->rf, 12);
-            u32 a7 = reg_read(&emu->rf, 17);
+            u32 a0 = reg_read(&h->rf, 10);
+            u32 a1 = reg_read(&h->rf, 11);
+            u32 a2 = reg_read(&h->rf, 12);
+            u32 a7 = reg_read(&h->rf, 17);
 
             switch (a7) {
             case 0:
             case 93: {
-                emu->state     = EMU_HALTED;
+                h->state     = EMU_HALTED;
                 emu->exit_code = a0;
                 printf("[SYSTEM] exit(%u)\n", a0);
                 break;
@@ -654,36 +688,40 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                     putchar(ch);
                 }
                 fflush(stdout);
-                reg_write(&emu->rf, 10, i);   /* 返回实际写出的字节数 */
+                reg_write(&h->rf, 10, i);   /* 返回实际写出的字节数 */
                 break;
             }
 
             default:
                 printf("[SYSTEM] unknown syscall a7=%u (pc=0x%08X)\n", a7, pc);
-                emu->state = EMU_EXCEPTION;
+                h->state = EMU_EXCEPTION;
                 break;
             }
         } else if (inst->raw == 0x00100073) {       /* EBREAK */
-            if (emu->csr.mtvec != 0) {
+            if (h->csr.mtvec != 0) {
                 if (!trap_raise(emu, EXC_BREAKPOINT, 0, pc)) {
-                    emu->state = EMU_EXCEPTION;
+                    h->state = EMU_EXCEPTION;
                     return false;
                 }
                 return true;
             }
-            emu->state     = EMU_HALTED;
+            h->state     = EMU_HALTED;
             emu->exit_code = 0;
             printf("[SYSTEM] ebreak: halted\n");
         } else {
-            /* CSR 指令 */
-            u32 csr_addr = inst->imm;  /* CSR 地址在 imm 字段 */
+            /*
+             * CSR 指令。CSR 地址在 imm 字段, 但 I 型立即数是符号扩展的,
+             * 0xF14 (mhartid) 这类最高位为 1 的地址会变成 0xFFFFFF14,
+             * 必须截回 12 位 —— 规范里 CSR 编号本来就只有 12 位。
+             */
+            u32 csr_addr = inst->imm & 0xFFFu;
             u32 csr_val, wdata;
             int csr_wr;
 
             /* v0.11: FS=Off 时 fflags/frm/fcsr 不可读写 */
             if ((csr_addr == CSR_FFLAGS || csr_addr == CSR_FRM ||
                  csr_addr == CSR_FCSR) &&
-                !csr_fpu_enabled(&emu->csr)) {
+                !csr_fpu_enabled(&h->csr)) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
@@ -693,7 +731,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              *   0x100 sstatus → S; 0x300 mstatus → M; 0x180 satp → S。
              * U 态访问 sstatus 仍然非法; S 态访问 mstatus 也非法。
              */
-            if (!csr_priv_ok(emu->priv, csr_addr)) {
+            if (!csr_priv_ok(h->priv, csr_addr)) {
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
             }
@@ -706,7 +744,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             }
 
             ok  = true;
-            csr_val = csr_read(&emu->csr, csr_addr, &ok);
+            csr_val = csr_read(&h->csr, csr_addr, &ok);
             if (!ok) {              /* 未知 CSR */
                 fault_cause = EXC_ILLEGAL_INST;
                 goto except;
@@ -735,36 +773,55 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 goto unknown;
             }
 
-            csr_write(&emu->csr, csr_addr, wdata, &ok);
-            if (!ok) {
-                fault_cause = EXC_ILLEGAL_INST;   /* 不存在的 CSR 属于非法指令 */
-                goto except;
-            }
-
             /*
-             * 写浮点 CSR (fflags/frm/fcsr) 也算"动过浮点状态",
-             * FS 变成 Dirty。只读的 CSRRS/CSRRC 且 rs1=0 不算写。
+             * 这条指令到底写不写 CSR?
+             *   CSRRW/CSRRWI 一定写;
+             *   CSRRS/CSRRC/CSRRSI/CSRRCI 在源操作数为 0 时只是读。
+             *
+             * 纯读不能再走 csr_write —— 写只读 CSR (比如 mhartid) 会
+             * 返回失败, 被当成非法指令, 这正是 v0.12 第一次跑多 hart
+             * 自测时踩到的坑。
              */
             csr_wr = (inst->funct3 == F3_CSRRW ||
                       inst->funct3 == F3_CSRRWI ||
                       ((inst->funct3 == F3_CSRRS || inst->funct3 == F3_CSRRC ||
                         inst->funct3 == F3_CSRRSI || inst->funct3 == F3_CSRRCI) &&
                        inst->rs1 != 0));
+
+            if (csr_wr) {
+                csr_write(&h->csr, csr_addr, wdata, &ok);
+                if (!ok) {
+                    fault_cause = EXC_ILLEGAL_INST;   /* 不存在的 CSR 属于非法指令 */
+                    goto except;
+                }
+            }
+
+            /*
+             * 写浮点 CSR (fflags/frm/fcsr) 也算"动过浮点状态",
+             * FS 变成 Dirty。
+             */
             if (csr_wr && (csr_addr == CSR_FFLAGS || csr_addr == CSR_FRM ||
                            csr_addr == CSR_FCSR)) {
-                csr_fpu_dirty(&emu->csr);
+                csr_fpu_dirty(&h->csr);
             }
 
             /* 回写旧 CSR 值到 rd（rd=x0 则丢弃） */
             if (inst->rd != 0) {
-                reg_write(&emu->rf, inst->rd, csr_val);
+                reg_write(&h->rf, inst->rd, csr_val);
             }
         }
         break;
 
     /* ===================== FENCE ===================== */
+    /*
+     * v0.12: 多 hart 之后 fence 仍然不需要做任何事。
+     *
+     * 真实 CPU 会重排访存, fence 用来约束顺序; 这个模拟器里
+     * 所有 hart 是串行轮转执行的, 每条访存都立刻生效, 内存模型
+     * 等价于顺序一致 (SC) —— 比 RVWMO 强, 任何 fence 都不会再
+     * 改变可见性。保留这条指令的合法性检查即可。
+     */
     case OP_FENCE:
-        /* 模拟器不需要做任何事 */
         break;
 
     default:
@@ -772,7 +829,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     }
 
     /* 更新 PC */
-    emu->rf.pc = next_pc;
+    h->rf.pc = next_pc;
 
     return true;
 
@@ -783,7 +840,7 @@ unknown:
     }
     printf("[EXEC] UNKNOWN instruction: raw=0x%08X opcode=0x%02X f3=%u f7=%u\n",
            inst->raw, inst->opcode, inst->funct3, inst->funct7);
-    emu->state = EMU_EXCEPTION;
+    h->state = EMU_EXCEPTION;
     return false;
 
 except:
@@ -795,7 +852,7 @@ except:
         }
     }
     printf("[EXEC] MEMORY/CSR exception at pc=0x%08X addr=0x%08X\n", pc, addr);
-    emu->state = EMU_EXCEPTION;
+    h->state = EMU_EXCEPTION;
     return false;
 }
 
@@ -820,6 +877,7 @@ static void mem_write_inst(memory_t *mem, u32 offset, u32 raw)
 void execute_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     u32 val;
     int pass = 0, fail = 0;
     u32 base = 0x0000;  /* 测试程序基址 */
@@ -833,7 +891,7 @@ void execute_selftest(void)
     /* ==================== ADDI ==================== */
     printf("── ADDI (add immediate) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, 42   → x1 = 42 */
     mem_write_inst(&emu.mem, base,     0x02A00093);
@@ -844,18 +902,18 @@ void execute_selftest(void)
     /* ecall (halt) */
     mem_write_inst(&emu.mem, base + 12, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 4);
 
-    val = reg_read(&emu.rf, 1);  CHECK(val == 42,          "addi x1, x0, 42");
-    val = reg_read(&emu.rf, 2);  CHECK(val == 0xFFFFFFFF,  "addi x2, x0, -1");
-    val = reg_read(&emu.rf, 3);  CHECK(val == 142,         "addi x3, x1, 100");
+    val = reg_read(&h->rf, 1);  CHECK(val == 42,          "addi x1, x0, 42");
+    val = reg_read(&h->rf, 2);  CHECK(val == 0xFFFFFFFF,  "addi x2, x0, -1");
+    val = reg_read(&h->rf, 3);  CHECK(val == 142,         "addi x3, x1, 100");
     emu_free(&emu);
 
     /* ==================== ALU R-type ==================== */
     printf("── ALU R-type ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, 10   → x1 = 10 */
     mem_write_inst(&emu.mem, base,      0x00A00093);
@@ -882,26 +940,26 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 44, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 12);
 
-    val = reg_read(&emu.rf, 1);   CHECK(val == 10, "addi x1,10");
-    val = reg_read(&emu.rf, 2);   CHECK(val == 3,  "addi x2,3");
-    val = reg_read(&emu.rf, 3);   CHECK(val == 13, "add  x3,x1,x2");
-    val = reg_read(&emu.rf, 4);   CHECK(val == 7,  "sub  x4,x1,x2");
-    val = reg_read(&emu.rf, 5);   CHECK(val == 1,  "slt  x5,x2,x1");
-    val = reg_read(&emu.rf, 6);   CHECK(val == 1,  "sltu x6,x2,x1");
-    val = reg_read(&emu.rf, 7);   CHECK(val == 9,  "xor  x7,x1,x2");
-    val = reg_read(&emu.rf, 8);   CHECK(val == 11, "or   x8,x1,x2");
-    val = reg_read(&emu.rf, 9);   CHECK(val == 2,  "and  x9,x1,x2");
-    val = reg_read(&emu.rf, 10);  CHECK(val == 80, "sll  x10,x1,x2");
-    val = reg_read(&emu.rf, 11);  CHECK(val == 1,  "srl  x11,x1,x2");
+    val = reg_read(&h->rf, 1);   CHECK(val == 10, "addi x1,10");
+    val = reg_read(&h->rf, 2);   CHECK(val == 3,  "addi x2,3");
+    val = reg_read(&h->rf, 3);   CHECK(val == 13, "add  x3,x1,x2");
+    val = reg_read(&h->rf, 4);   CHECK(val == 7,  "sub  x4,x1,x2");
+    val = reg_read(&h->rf, 5);   CHECK(val == 1,  "slt  x5,x2,x1");
+    val = reg_read(&h->rf, 6);   CHECK(val == 1,  "sltu x6,x2,x1");
+    val = reg_read(&h->rf, 7);   CHECK(val == 9,  "xor  x7,x1,x2");
+    val = reg_read(&h->rf, 8);   CHECK(val == 11, "or   x8,x1,x2");
+    val = reg_read(&h->rf, 9);   CHECK(val == 2,  "and  x9,x1,x2");
+    val = reg_read(&h->rf, 10);  CHECK(val == 80, "sll  x10,x1,x2");
+    val = reg_read(&h->rf, 11);  CHECK(val == 1,  "srl  x11,x1,x2");
     emu_free(&emu);
 
     /* ==================== Shift variants ==================== */
     printf("── Shift variants ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, -8   → x1 = -8 (0xFFFFFFF8) */
     mem_write_inst(&emu.mem, base,      0xFF800093);
@@ -914,18 +972,18 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 16, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 5);
 
-    val = reg_read(&emu.rf, 2);  CHECK((s32)val == -2,         "srai x2, x1, 2");
-    val = reg_read(&emu.rf, 3);  CHECK(val == 0x7FFFFFFC,      "srli x3, x1, 1");
-    val = reg_read(&emu.rf, 4);  CHECK((s32)val == -128,       "slli x4, x1, 4");
+    val = reg_read(&h->rf, 2);  CHECK((s32)val == -2,         "srai x2, x1, 2");
+    val = reg_read(&h->rf, 3);  CHECK(val == 0x7FFFFFFC,      "srli x3, x1, 1");
+    val = reg_read(&h->rf, 4);  CHECK((s32)val == -128,       "slli x4, x1, 4");
     emu_free(&emu);
 
     /* ==================== LUI / AUIPC ==================== */
     printf("── LUI / AUIPC ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* lui  x1, 0x12345  → x1 = 0x12345000 */
     mem_write_inst(&emu.mem, base,      0x123450B7);
@@ -934,17 +992,17 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 8,  0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 3);
 
-    val = reg_read(&emu.rf, 1);  CHECK(val == 0x12345000, "lui x1, 0x12345");
-    val = reg_read(&emu.rf, 2);  CHECK(val == 0x10004,    "auipc x2, 0x10 (pc=4 + 0x10000)");
+    val = reg_read(&h->rf, 1);  CHECK(val == 0x12345000, "lui x1, 0x12345");
+    val = reg_read(&h->rf, 2);  CHECK(val == 0x10004,    "auipc x2, 0x10 (pc=4 + 0x10000)");
     emu_free(&emu);
 
     /* ==================== Branch (taken) ==================== */
     printf("── Branch (taken) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, 5    → x1 = 5 */
     mem_write_inst(&emu.mem, base,      0x00500093);
@@ -959,17 +1017,17 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    val = reg_read(&emu.rf, 3);  CHECK(val == 0, "x3 = 0 (skipped)");
-    val = reg_read(&emu.rf, 4);  CHECK(val == 1, "x4 = 1 (branch taken)");
+    val = reg_read(&h->rf, 3);  CHECK(val == 0, "x3 = 0 (skipped)");
+    val = reg_read(&h->rf, 4);  CHECK(val == 1, "x4 = 1 (branch taken)");
     emu_free(&emu);
 
     /* ==================== Branch (not taken) ==================== */
     printf("── Branch (not taken) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, 5 */
     mem_write_inst(&emu.mem, base,      0x00500093);
@@ -984,17 +1042,17 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    val = reg_read(&emu.rf, 3);  CHECK(val == 0, "x3 = 0 (skipped)");
-    val = reg_read(&emu.rf, 4);  CHECK(val == 2, "x4 = 2 (bne taken)");
+    val = reg_read(&h->rf, 3);  CHECK(val == 0, "x3 = 0 (skipped)");
+    val = reg_read(&h->rf, 4);  CHECK(val == 2, "x4 = 2 (bne taken)");
     emu_free(&emu);
 
     /* ==================== JAL / JALR ==================== */
     printf("── JAL / JALR ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* jal  x1, +12      → x1 = pc+4 = 4, pc = 0+12 = 12 */
     mem_write_inst(&emu.mem, base,      0x00C000EF);
@@ -1015,18 +1073,18 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 8,  0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    val = reg_read(&emu.rf, 1);  CHECK(val == 4,    "jal: ra = 4");
-    val = reg_read(&emu.rf, 4);  CHECK(val == 20,   "jalr: rd = 20");
-    val = reg_read(&emu.rf, 5);  CHECK(val == 42,   "executed after jalr return");
+    val = reg_read(&h->rf, 1);  CHECK(val == 4,    "jal: ra = 4");
+    val = reg_read(&h->rf, 4);  CHECK(val == 20,   "jalr: rd = 20");
+    val = reg_read(&h->rf, 5);  CHECK(val == 42,   "executed after jalr return");
     emu_free(&emu);
 
     /* ==================== LW / SW ==================== */
     printf("── LW / SW (memory) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x1, x0, 0x100 → x1 = 256 (memory address) */
     mem_write_inst(&emu.mem, base,      0x10000093);
@@ -1048,11 +1106,11 @@ void execute_selftest(void)
     /* ecall */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    val = reg_read(&emu.rf, 2);  CHECK(val == 0x12345678, "x2 = 0x12345678");
-    val = reg_read(&emu.rf, 3);  CHECK(val == 0x12345678, "lw x3 = mem[256]");
+    val = reg_read(&h->rf, 2);  CHECK(val == 0x12345678, "x2 = 0x12345678");
+    val = reg_read(&h->rf, 3);  CHECK(val == 0x12345678, "lw x3 = mem[256]");
     /* verify memory directly */
     {
         u32 mem_val;
@@ -1064,24 +1122,24 @@ void execute_selftest(void)
     /* ==================== ECALL exit ==================== */
     printf("── ECALL ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* addi x10, x0, 42  → a0 = exit_code 42 */
     mem_write_inst(&emu.mem, base, 0x02A00513);
     /* ecall */
     mem_write_inst(&emu.mem, base + 4, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 2);
 
-    CHECK(emu.state == EMU_HALTED, "ecall → EMU_HALTED");
+    CHECK(h->state == EMU_HALTED, "ecall → EMU_HALTED");
     CHECK(emu.exit_code == 42,     "exit_code = 42");
     emu_free(&emu);
 
     /* ==================== RV32M ==================== */
     printf("── RV32M (mul/div) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     /* x1 = 7, x2 = 3 */
     mem_write_inst(&emu.mem, base,      0x00700093);  /* addi x1, x0, 7  */
@@ -1106,27 +1164,27 @@ void execute_selftest(void)
     mem_write_inst(&emu.mem, base + 60, 0x02D0E7B3);  /* rem    x15, x1, x13 */
     mem_write_inst(&emu.mem, base + 64, 0x00000073);  /* ecall */
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 18);
 
-    val = reg_read(&emu.rf, 3);   CHECK(val == 21,         "mul    7*3 = 21");
-    val = reg_read(&emu.rf, 4);   CHECK(val == 0,          "mulh   7*3 high = 0");
-    val = reg_read(&emu.rf, 5);   CHECK(val == 0,          "mulhu  7*3 high = 0");
-    val = reg_read(&emu.rf, 6);   CHECK(val == 2,          "div    7/3 = 2");
-    val = reg_read(&emu.rf, 7);   CHECK(val == 2,          "divu   7/3 = 2");
-    val = reg_read(&emu.rf, 8);   CHECK(val == 1,          "rem    7%3 = 1");
-    val = reg_read(&emu.rf, 9);   CHECK(val == 1,          "remu   7%3 = 1");
-    val = reg_read(&emu.rf, 11);  CHECK((s32)val == -2,    "div   -7/3 = -2");
-    val = reg_read(&emu.rf, 12);  CHECK((s32)val == -1,    "rem   -7%3 = -1");
-    val = reg_read(&emu.rf, 16);  CHECK(val == 0xFFFFFFFF, "mulh  -7*3 high = -1");
-    val = reg_read(&emu.rf, 14);  CHECK(val == 0xFFFFFFFF, "div   7/0 = -1");
-    val = reg_read(&emu.rf, 15);  CHECK(val == 7,          "rem   7%0 = 7");
+    val = reg_read(&h->rf, 3);   CHECK(val == 21,         "mul    7*3 = 21");
+    val = reg_read(&h->rf, 4);   CHECK(val == 0,          "mulh   7*3 high = 0");
+    val = reg_read(&h->rf, 5);   CHECK(val == 0,          "mulhu  7*3 high = 0");
+    val = reg_read(&h->rf, 6);   CHECK(val == 2,          "div    7/3 = 2");
+    val = reg_read(&h->rf, 7);   CHECK(val == 2,          "divu   7/3 = 2");
+    val = reg_read(&h->rf, 8);   CHECK(val == 1,          "rem    7%3 = 1");
+    val = reg_read(&h->rf, 9);   CHECK(val == 1,          "remu   7%3 = 1");
+    val = reg_read(&h->rf, 11);  CHECK((s32)val == -2,    "div   -7/3 = -2");
+    val = reg_read(&h->rf, 12);  CHECK((s32)val == -1,    "rem   -7%3 = -1");
+    val = reg_read(&h->rf, 16);  CHECK(val == 0xFFFFFFFF, "mulh  -7*3 high = -1");
+    val = reg_read(&h->rf, 14);  CHECK(val == 0xFFFFFFFF, "div   7/0 = -1");
+    val = reg_read(&h->rf, 15);  CHECK(val == 7,          "rem   7%0 = 7");
     emu_free(&emu);
 
     /* ==================== RV32A (LR/SC + AMO) ==================== */
     printf("── RV32A (lr/sc + amo) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     mem_write_inst(&emu.mem, base + 0,  0x10000093);  /* addi x1, x0, 0x100 */
     mem_write_inst(&emu.mem, base + 4,  0x00500113);  /* addi x2, x0, 5 */
@@ -1145,18 +1203,18 @@ void execute_selftest(void)
     mem_write_inst(&emu.mem, base + 56, 0x0000A603);  /* lw   x12, 0(x1) */
     mem_write_inst(&emu.mem, base + 60, 0x00000073);  /* ecall */
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 16);
 
-    val = reg_read(&emu.rf, 3);   CHECK(val == 5,  "lr.w  x3 = 5");
-    val = reg_read(&emu.rf, 4);   CHECK(val == 0,  "sc.w  x4 = 0 (success)");
-    val = reg_read(&emu.rf, 5);   CHECK(val == 7,  "lw    x5 = 7 (sc wrote)");
-    val = reg_read(&emu.rf, 6);   CHECK(val == 7,  "lr.w  x6 = 7");
-    val = reg_read(&emu.rf, 8);   CHECK(val == 1,  "sc.w  x8 = 1 (store broke reservation)");
-    val = reg_read(&emu.rf, 9);   CHECK(val == 9,  "amoadd.w  x9 = 9 (old value)");
-    val = reg_read(&emu.rf, 10);  CHECK(val == 16, "amomax.w  x10 = 16 (old value)");
-    val = reg_read(&emu.rf, 11);  CHECK(val == 16, "amominu.w x11 = 16 (old value)");
-    val = reg_read(&emu.rf, 12);  CHECK(val == 7,  "lw    x12 = 7 (min(16,7))");
+    val = reg_read(&h->rf, 3);   CHECK(val == 5,  "lr.w  x3 = 5");
+    val = reg_read(&h->rf, 4);   CHECK(val == 0,  "sc.w  x4 = 0 (success)");
+    val = reg_read(&h->rf, 5);   CHECK(val == 7,  "lw    x5 = 7 (sc wrote)");
+    val = reg_read(&h->rf, 6);   CHECK(val == 7,  "lr.w  x6 = 7");
+    val = reg_read(&h->rf, 8);   CHECK(val == 1,  "sc.w  x8 = 1 (store broke reservation)");
+    val = reg_read(&h->rf, 9);   CHECK(val == 9,  "amoadd.w  x9 = 9 (old value)");
+    val = reg_read(&h->rf, 10);  CHECK(val == 16, "amomax.w  x10 = 16 (old value)");
+    val = reg_read(&h->rf, 11);  CHECK(val == 16, "amominu.w x11 = 16 (old value)");
+    val = reg_read(&h->rf, 12);  CHECK(val == 7,  "lw    x12 = 7 (min(16,7))");
     {
         u32 mem_val;
         memory_read32(&emu.mem, 0x100, &mem_val);
@@ -1176,62 +1234,62 @@ void execute_selftest(void)
         bool ok2;
 
         emu_init(&emu, MEM_SIZE);
-        emu.state = EMU_RUNNING;
-        emu.csr.mtvec = 0x100;
-        emu.rf.fregs[2] = fp32_box(0x3F800000u);    /* 1.0 */
-        emu.rf.fregs[3] = fp32_box(0x40000000u);    /* 2.0 */
+        h->state = EMU_RUNNING;
+        h->csr.mtvec = 0x100;
+        h->rf.fregs[2] = fp32_box(0x3F800000u);    /* 1.0 */
+        h->rf.fregs[3] = fp32_box(0x40000000u);    /* 2.0 */
 
         /* FS=Off: FP 运算非法 */
-        emu.csr.mstatus &= ~MSTATUS_FS_MASK;
+        h->csr.mstatus &= ~MSTATUS_FS_MASK;
         mem_write_inst(&emu.mem, base, fadd);
-        emu.rf.pc = base;
+        h->rf.pc = base;
         emu_run(&emu, 1);
-        CHECK(emu.csr.mcause == EXC_ILLEGAL_INST,
+        CHECK(h->csr.mcause == EXC_ILLEGAL_INST,
               "FS=Off: fadd traps (cause=2)");
-        CHECK(emu.csr.mtval == fadd, "FS=Off: mtval = instruction bits");
-        CHECK(emu.csr.mepc == base, "FS=Off: mepc = faulting pc");
-        CHECK(emu.rf.pc == 0x100, "FS=Off: pc jumps to mtvec");
-        CHECK(emu.rf.fregs[1] == 0, "FS=Off: f1 not written");
+        CHECK(h->csr.mtval == fadd, "FS=Off: mtval = instruction bits");
+        CHECK(h->csr.mepc == base, "FS=Off: mepc = faulting pc");
+        CHECK(h->rf.pc == 0x100, "FS=Off: pc jumps to mtvec");
+        CHECK(h->rf.fregs[1] == 0, "FS=Off: f1 not written");
 
         /* FS=Off: 读 fcsr 也非法 */
         mem_write_inst(&emu.mem, base, csr_rd);
-        emu.rf.pc = base;
+        h->rf.pc = base;
         emu_run(&emu, 1);
-        CHECK(emu.csr.mcause == EXC_ILLEGAL_INST,
+        CHECK(h->csr.mcause == EXC_ILLEGAL_INST,
               "FS=Off: csrrs fcsr traps");
-        CHECK(emu.csr.mtval == csr_rd,
+        CHECK(h->csr.mtval == csr_rd,
               "FS=Off: mtval = CSR instruction bits");
 
         /* FS=Initial: fadd 正常执行, FS 变 Dirty */
-        emu.csr.mstatus = (emu.csr.mstatus & ~MSTATUS_FS_MASK) |
+        h->csr.mstatus = (h->csr.mstatus & ~MSTATUS_FS_MASK) |
                           MSTATUS_FS_INITIAL;
         mem_write_inst(&emu.mem, base, fadd);
-        emu.rf.pc = base;
+        h->rf.pc = base;
         emu_run(&emu, 1);
-        CHECK(emu.rf.fregs[1] == fp32_box(0x40400000u),
+        CHECK(h->rf.fregs[1] == fp32_box(0x40400000u),
               "FS=Initial: fadd 1.0+2.0 = 3.0");
-        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
+        CHECK((h->csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
               "FS=Initial -> Dirty after FP instruction");
 
         /* 读 fcsr 不算写, FS 保持 Initial */
-        emu.csr.mstatus = (emu.csr.mstatus & ~MSTATUS_FS_MASK) |
+        h->csr.mstatus = (h->csr.mstatus & ~MSTATUS_FS_MASK) |
                           MSTATUS_FS_INITIAL;
         mem_write_inst(&emu.mem, base, csr_rd);
-        emu.rf.pc = base;
+        h->rf.pc = base;
         emu_run(&emu, 1);
-        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_INITIAL,
+        CHECK((h->csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_INITIAL,
               "read fcsr keeps FS = Initial");
 
         /* 写 fcsr → Dirty */
         mem_write_inst(&emu.mem, base, csr_wr);
-        emu.rf.pc = base;
+        h->rf.pc = base;
         emu_run(&emu, 1);
-        CHECK((emu.csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
+        CHECK((h->csr.mstatus & MSTATUS_FS_MASK) == MSTATUS_FS_DIRTY,
               "write fcsr sets FS = Dirty");
 
         /* sstatus 能看到 FS */
-        CHECK((csr_read(&emu.csr, CSR_SSTATUS, &ok2) & MSTATUS_FS_MASK) ==
-              (emu.csr.mstatus & MSTATUS_FS_MASK),
+        CHECK((csr_read(&h->csr, CSR_SSTATUS, &ok2) & MSTATUS_FS_MASK) ==
+              (h->csr.mstatus & MSTATUS_FS_MASK),
               "sstatus exposes FS bits");
         emu_free(&emu);
     }

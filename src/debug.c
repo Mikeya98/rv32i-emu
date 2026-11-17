@@ -171,12 +171,13 @@ static const char *state_name(emu_state_t s)
 
 static void show_status(emulator_t *emu)
 {
-    printf("[%s] pc=0x%08X priv=%s", state_name(emu->state), emu->rf.pc,
-           (emu->priv == PRIV_M) ? "M" : "U");
-    if (emu->csr.satp & SATP_MODE_BIT) {
-        printf(" satp=Sv32@0x%X", (emu->csr.satp & SATP_PPN_MASK) << 12);
+    hart_t *h = emu_hart(emu);
+    printf("[%s] pc=0x%08X priv=%s", state_name(h->state), h->rf.pc,
+           (h->priv == PRIV_M) ? "M" : "U");
+    if (h->csr.satp & SATP_MODE_BIT) {
+        printf(" satp=Sv32@0x%X", (h->csr.satp & SATP_PPN_MASK) << 12);
     }
-    if (emu->state == EMU_HALTED) {
+    if (h->state == EMU_HALTED) {
         printf("  exit_code=%u", emu->exit_code);
     }
     printf("\n");
@@ -186,19 +187,20 @@ static void show_status(emulator_t *emu)
 
 static void cmd_step(emulator_t *emu, u32 n)
 {
+    hart_t *h = emu_hart(emu);
     u32 i;
 
     for (i = 0; i < n; i++) {
         u32 pc;
         decoded_inst_t inst;
 
-        if (emu->state != EMU_RUNNING) {
+        if (h->state != EMU_RUNNING) {
             printf("emulator is not running\n");
             show_status(emu);
             return;
         }
 
-        pc = emu->rf.pc;
+        pc = h->rf.pc;
         printf("[step] pc=0x%08X\n", pc);
         show_inst(emu, pc);
 
@@ -207,9 +209,9 @@ static void cmd_step(emulator_t *emu, u32 n)
         }
     }
 
-    if (emu->state == EMU_RUNNING) {
+    if (h->state == EMU_RUNNING) {
         printf("[next]\n");
-        show_inst(emu, emu->rf.pc);
+        show_inst(emu, h->rf.pc);
     } else {
         show_status(emu);
     }
@@ -217,10 +219,11 @@ static void cmd_step(emulator_t *emu, u32 n)
 
 static void cmd_continue(emulator_t *emu)
 {
+    hart_t *h = emu_hart(emu);
     u32 steps = 0;
     decoded_inst_t inst;
 
-    while (emu->state == EMU_RUNNING) {
+    while (h->state == EMU_RUNNING) {
         if (steps >= CONTINUE_LIMIT) {
             printf("stopped after %u steps (limit). Use 's' to continue.\n",
                    CONTINUE_LIMIT);
@@ -233,16 +236,16 @@ static void cmd_continue(emulator_t *emu)
         }
         steps++;
 
-        if (emu->state != EMU_RUNNING) {
+        if (h->state != EMU_RUNNING) {
             show_status(emu);
             return;
         }
 
         /* 每执行完一条再检查, 避免停在当前断点上反复触发 */
-        if (bp_find(emu->rf.pc) >= 0) {
+        if (bp_find(h->rf.pc) >= 0) {
             printf("[break] hit breakpoint\n");
             show_status(emu);
-            show_inst(emu, emu->rf.pc);
+            show_inst(emu, h->rf.pc);
             printf("executed %u instructions\n", steps);
             return;
         }
@@ -279,8 +282,9 @@ static void cmd_disasm(emulator_t *emu, u32 addr, u32 n)
 
 static void cmd_regs(emulator_t *emu)
 {
-    regfile_dump(&emu->rf);
-    csr_dump(&emu->csr);
+    hart_t *h = emu_hart(emu);
+    regfile_dump(&h->rf);
+    csr_dump(&h->csr);
 }
 
 static void print_help(void)
@@ -296,6 +300,7 @@ static void print_help(void)
         "  bl            list breakpoints\n"
         "  bd <addr>     delete breakpoint\n"
         "  bc            clear all breakpoints\n"
+        "  hart <n>      switch to hart n (v0.12)\n"
         "  h             help\n"
         "  q             quit\n");
 }
@@ -304,13 +309,14 @@ static void print_help(void)
 
 void debug_repl(emulator_t *emu)
 {
+    hart_t *h = emu_hart(emu);
     char line[128];
 
     printf("\n=== RV32I Debugger ===\n");
     printf("Type 'h' for help, 'q' to quit.\n");
     show_status(emu);
-    if (emu->state == EMU_RUNNING) {
-        show_inst(emu, emu->rf.pc);
+    if (h->state == EMU_RUNNING) {
+        show_inst(emu, h->rf.pc);
     }
 
     while (1) {
@@ -344,7 +350,18 @@ void debug_repl(emulator_t *emu)
         args = line + strlen(cmd);
         while (*args == ' ' || *args == '\t') args++;
 
-        if (strcmp(cmd, "s") == 0 || strcmp(cmd, "step") == 0) {
+        if (strcmp(cmd, "hart") == 0) {
+            /* v0.12: 切换调试对象; 之后的 s/d/r 都针对这个 hart */
+            n = 0;
+            if (!next_u32(&args, &n) || n >= emu->nharts) {
+                printf("usage: hart <0..%u>\n", emu->nharts - 1);
+                continue;
+            }
+            emu->cur = n;
+            h = emu_hart(emu);
+            printf("switched to hart %u\n", n);
+            show_status(emu);
+        } else if (strcmp(cmd, "s") == 0 || strcmp(cmd, "step") == 0) {
             n = 1;
             next_u32(&args, &n);
             cmd_step(emu, n);
@@ -361,7 +378,7 @@ void debug_repl(emulator_t *emu)
             next_u32(&args, &n);
             memory_dump(&emu->mem, addr, n);
         } else if (strcmp(cmd, "d") == 0 || strcmp(cmd, "dis") == 0) {
-            addr = emu->rf.pc;
+            addr = h->rf.pc;
             n = 8;
             next_u32(&args, &addr);
             next_u32(&args, &n);

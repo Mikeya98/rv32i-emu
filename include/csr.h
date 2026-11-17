@@ -43,6 +43,7 @@
 #define CSR_MCAUSE      0x342
 #define CSR_MTVAL       0x343
 #define CSR_MIP         0x344
+#define CSR_MHARTID     0xF14   /* 本 hart 的编号 (只读, v0.12) */
 #define CSR_MCYCLE      0xB00
 
 /* satp 字段 (Sv32) */
@@ -52,9 +53,16 @@
 #define CSR_MMIO_BASE   0x20000000  /* 简易 MMIO 基址 */
 #define CSR_MMIO_UART   0x20000000  /* UART 输出 (写字节即打印) */
 
-/* CLINT 简化版: 只实现 mtime / mtimecmp 的低 32 位 (地址与真实 CLINT 一致) */
-#define CLINT_MTIMECMP_LO  0x02004000u
-#define CLINT_MTIME_LO     0x0200BFF8u
+/*
+ * CLINT 简化版: 地址与真实 CLINT 一致。
+ *   mtimecmp 每个 hart 占 8 字节: hart0 在 0x02004000, hart1 在 0x02004008 …
+ *   mtime 全机器共享一个 64 位计数器, 低 32 位在 0x0200BFF8。
+ * 只实现低 32 位比较 (高 32 位写入被忽略)。
+ */
+#define CLINT_MTIMECMP_BASE 0x02004000u
+#define CLINT_MTIMECMP_LO(h) (CLINT_MTIMECMP_BASE + 8u * (h))
+#define CLINT_MTIME_LO      0x0200BFF8u
+#define CLINT_MTIME_HI      0x0200BFFCu
 
 /* mstatus 位 */
 #define MSTATUS_SIE        (1u << 1)    /* S 态中断使能 */
@@ -147,6 +155,9 @@ typedef struct {
     u32  mie;
     u32  mip;
     u64  mcycle;       /* 64-bit wide */
+
+    /* v0.12: 本 hart 编号, 复位时写入, 之后只读 */
+    u32  mhartid;
 } csr_t;
 
 /* --- API --- */

@@ -7,21 +7,10 @@
 #include "csr.h"
 #include <stdio.h>
 
-void trap_init(emulator_t *emu)
-{
-    emu->mtime    = 0;
-    emu->mtimecmp = 0;      /* 0 = 定时器关闭 */
-
-    /*
-     * v0.11: 复位后 FS = Initial。真实硬件也允许复位成 Off, 但那样
-     * 每段浮点程序都得先写 mstatus 才能跑 —— 对模拟器不友好。
-     */
-    emu->csr.mstatus = MSTATUS_FS_INITIAL;
-}
-
 bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
 {
-    csr_t *csr = &emu->csr;
+    hart_t *h = emu_hart(emu);
+    csr_t *csr = &h->csr;
     u32 m;
     u32 code = cause & ~MCAUSE_IRQ_BIT;
     bool irq = (cause & MCAUSE_IRQ_BIT) != 0;
@@ -35,7 +24,7 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
      * 那套完全分开 —— 这样 M 态 handler 正在处理一个 trap 时, 被
      * 委托的另一个 trap 不会覆盖它的 mepc。
      */
-    if (emu->priv <= PRIV_S && code < 16u && ((deleg >> code) & 1u)) {
+    if (h->priv <= PRIV_S && code < 16u && ((deleg >> code) & 1u)) {
         if (csr->stvec == 0) {
             return false;
         }
@@ -51,15 +40,15 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
             m &= ~MSTATUS_SPIE;
         }
         m &= ~MSTATUS_SIE;
-        if (emu->priv == PRIV_S) {
+        if (h->priv == PRIV_S) {
             m |= MSTATUS_SPP;
         } else {
             m &= ~MSTATUS_SPP;
         }
         csr->mstatus = m;
 
-        emu->priv = PRIV_S;
-        emu->rf.pc = csr->stvec;
+        h->priv = PRIV_S;
+        h->rf.pc = csr->stvec;
         return true;
     }
 
@@ -87,20 +76,21 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc)
         m &= ~MSTATUS_MPIE;
     }
     m &= ~MSTATUS_MIE;
-    m = (m & ~MSTATUS_MPP_MASK) | ((emu->priv & 0x3u) << 11);
+    m = (m & ~MSTATUS_MPP_MASK) | ((h->priv & 0x3u) << 11);
 
     csr->mstatus = m;
 
     /* 进 trap 一律在 M 态执行 handler */
-    emu->priv = PRIV_M;
+    h->priv = PRIV_M;
 
-    emu->rf.pc = csr->mtvec;
+    h->rf.pc = csr->mtvec;
     return true;
 }
 
 bool trap_check_interrupt(emulator_t *emu, u32 epc)
 {
-    csr_t *csr = &emu->csr;
+    hart_t *h = emu_hart(emu);
+    csr_t *csr = &h->csr;
 
     emu->mtime++;
 
@@ -109,7 +99,7 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
      * 是 pending, 直到软件把 mtimecmp 写到更远的将来。这和真实
      * CLINT 的行为一致, handler 里不需要手动清 mip。
      */
-    if (emu->mtimecmp != 0 && emu->mtime >= emu->mtimecmp) {
+    if (h->mtimecmp != 0 && emu->mtime >= h->mtimecmp) {
         csr->mip |= MIP_MTIP;
     } else {
         csr->mip &= ~MIP_MTIP;
@@ -121,7 +111,7 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
      */
     if ((csr->mip & MIP_MTIP) &&
         (csr->mie & MIE_MTIE) &&
-        (emu->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE))) {
+        (h->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE))) {
         return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
     }
 
@@ -130,7 +120,8 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
 
 u32 trap_mret(emulator_t *emu)
 {
-    csr_t *csr = &emu->csr;
+    hart_t *h = emu_hart(emu);
+    csr_t *csr = &h->csr;
     u32 m = csr->mstatus;
 
     if (m & MSTATUS_MPIE) {
@@ -144,7 +135,7 @@ u32 trap_mret(emulator_t *emu)
      * 特权级回到 MPP 记录的那一级, MPP 复位成"所支持的最低特权级"。
      * 本模拟器只支持 M/U, 所以 MPP 清成 00 (U)。
      */
-    emu->priv = (m & MSTATUS_MPP_MASK) >> 11;
+    h->priv = (m & MSTATUS_MPP_MASK) >> 11;
     m = (m & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_U;
 
     csr->mstatus = m;
@@ -154,7 +145,8 @@ u32 trap_mret(emulator_t *emu)
 
 u32 trap_sret(emulator_t *emu)
 {
-    csr_t *csr = &emu->csr;
+    hart_t *h = emu_hart(emu);
+    csr_t *csr = &h->csr;
     u32 m = csr->mstatus;
 
     /*
@@ -169,7 +161,7 @@ u32 trap_sret(emulator_t *emu)
     }
     m |= MSTATUS_SPIE;
 
-    emu->priv = (m & MSTATUS_SPP) ? PRIV_S : PRIV_U;
+    h->priv = (m & MSTATUS_SPP) ? PRIV_S : PRIV_U;
     m &= ~MSTATUS_SPP;
 
     csr->mstatus = m;
@@ -195,6 +187,7 @@ static int trap_fail = 0;
 void trap_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     decoded_inst_t inst;
     u32 val;
     u32 pc;
@@ -209,33 +202,33 @@ void trap_selftest(void)
     /* ---------- 1. 没装 handler 时 ecall 保持旧的 syscall 行为 ---------- */
     printf("── ecall without mtvec (legacy syscall path) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.csr.mtvec = 0;
+    h->csr.mtvec = 0;
     /* 0x00000000: ecall (a7=0 → exit) */
     emu.mem.data[0] = 0x73; emu.mem.data[1] = 0x00;
     emu.mem.data[2] = 0x00; emu.mem.data[3] = 0x00;
-    emu.rf.pc = 0;
-    emu_state_t st = emu.state;
-    emu.state = EMU_RUNNING;
+    h->rf.pc = 0;
+    emu_state_t st = h->state;
+    h->state = EMU_RUNNING;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.state == EMU_HALTED, "ecall without handler → halt (exit 0)");
-    emu.state = st;
+    TRAP_CHECK(h->state == EMU_HALTED, "ecall without handler → halt (exit 0)");
+    h->state = st;
 
     /* ---------- 2. 装了 handler 后 ecall 进 trap ---------- */
     printf("\n── ecall traps to mtvec ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.csr.mtvec = 0x100;
-    emu.csr.mstatus = MSTATUS_MIE;      /* 进 trap 前中断是开的 */
-    emu.rf.pc = 0x40;
+    h->state = EMU_RUNNING;
+    h->csr.mtvec = 0x100;
+    h->csr.mstatus = MSTATUS_MIE;      /* 进 trap 前中断是开的 */
+    h->rf.pc = 0x40;
     emu.mem.data[0x40] = 0x73; emu.mem.data[0x41] = 0x00;
     emu.mem.data[0x42] = 0x00; emu.mem.data[0x43] = 0x00;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x100, "pc jumps to mtvec");
-    TRAP_CHECK(emu.csr.mcause == EXC_ECALL_M, "mcause = 11 (ecall from M)");
-    TRAP_CHECK(emu.csr.mepc == 0x40, "mepc = faulting pc");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MIE) == 0, "MIE cleared in handler");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MPIE) != 0, "MPIE saved MIE");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MPP_MASK) == MSTATUS_MPP_M,
+    TRAP_CHECK(h->rf.pc == 0x100, "pc jumps to mtvec");
+    TRAP_CHECK(h->csr.mcause == EXC_ECALL_M, "mcause = 11 (ecall from M)");
+    TRAP_CHECK(h->csr.mepc == 0x40, "mepc = faulting pc");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MIE) == 0, "MIE cleared in handler");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MPIE) != 0, "MPIE saved MIE");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MPP_MASK) == MSTATUS_MPP_M,
                "MPP = M-mode");
 
     /* ---------- 3. mret 恢复现场 ---------- */
@@ -244,64 +237,64 @@ void trap_selftest(void)
     emu.mem.data[0x100] = 0x73; emu.mem.data[0x101] = 0x00;
     emu.mem.data[0x102] = 0x20; emu.mem.data[0x103] = 0x30;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x40, "mret returns to mepc");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MIE) != 0, "MIE restored from MPIE");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MPIE) != 0, "MPIE forced to 1");
+    TRAP_CHECK(h->rf.pc == 0x40, "mret returns to mepc");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MIE) != 0, "MIE restored from MPIE");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MPIE) != 0, "MPIE forced to 1");
 
     /* ---------- 4. 非法指令 → mcause = 2, mtval = 指令本身 ---------- */
     printf("\n── illegal instruction ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.csr.mtvec = 0x200;
-    emu.rf.pc = 0x80;
+    h->state = EMU_RUNNING;
+    h->csr.mtvec = 0x200;
+    h->rf.pc = 0x80;
     /* 0xFFFFFFFF 是无效编码 */
     emu.mem.data[0x80] = 0xFF; emu.mem.data[0x81] = 0xFF;
     emu.mem.data[0x82] = 0xFF; emu.mem.data[0x83] = 0xFF;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x200, "illegal → pc = mtvec");
-    TRAP_CHECK(emu.csr.mcause == EXC_ILLEGAL_INST, "mcause = 2");
-    TRAP_CHECK(emu.csr.mtval == 0xFFFFFFFFu, "mtval = illegal instruction bits");
-    TRAP_CHECK(emu.csr.mepc == 0x80, "mepc = illegal instruction address");
+    TRAP_CHECK(h->rf.pc == 0x200, "illegal → pc = mtvec");
+    TRAP_CHECK(h->csr.mcause == EXC_ILLEGAL_INST, "mcause = 2");
+    TRAP_CHECK(h->csr.mtval == 0xFFFFFFFFu, "mtval = illegal instruction bits");
+    TRAP_CHECK(h->csr.mepc == 0x80, "mepc = illegal instruction address");
 
     /* ---------- 5. 定时器中断 ---------- */
     printf("\n── machine timer interrupt ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.csr.mtvec = 0x300;
-    emu.csr.mstatus = MSTATUS_MIE;
-    emu.csr.mie = MIE_MTIE;
-    emu.mtimecmp = 5;
-    emu.rf.pc = 0x400;
+    h->state = EMU_RUNNING;
+    h->csr.mtvec = 0x300;
+    h->csr.mstatus = MSTATUS_MIE;
+    h->csr.mie = MIE_MTIE;
+    h->mtimecmp = 5;
+    h->rf.pc = 0x400;
     /* 0x400: nop (addi x0, x0, 0) */
     emu.mem.data[0x400] = 0x13; emu.mem.data[0x401] = 0x00;
     emu.mem.data[0x402] = 0x00; emu.mem.data[0x403] = 0x00;
 
     /* 跑 5 步: mtime 从 0 到 5, 第 5 步应该进中断 */
     for (int i = 0; i < 5; i++) {
-        emu.rf.pc = 0x400;
+        h->rf.pc = 0x400;
         emu_step(&emu, &inst);
-        if (emu.rf.pc == 0x300) break;
+        if (h->rf.pc == 0x300) break;
     }
-    TRAP_CHECK(emu.rf.pc == 0x300, "timer IRQ jumps to mtvec");
-    TRAP_CHECK(emu.csr.mcause == MCAUSE_IRQ_TIMER, "mcause = 0x80000007");
-    TRAP_CHECK((emu.csr.mip & MIP_MTIP) != 0, "mip.MTIP pending");
-    TRAP_CHECK(emu.csr.mepc == 0x400, "mepc = next instruction");
+    TRAP_CHECK(h->rf.pc == 0x300, "timer IRQ jumps to mtvec");
+    TRAP_CHECK(h->csr.mcause == MCAUSE_IRQ_TIMER, "mcause = 0x80000007");
+    TRAP_CHECK((h->csr.mip & MIP_MTIP) != 0, "mip.MTIP pending");
+    TRAP_CHECK(h->csr.mepc == 0x400, "mepc = next instruction");
 
     /* handler 里把 mtimecmp 推远 → pending 自动清掉 */
-    emu.mtimecmp = emu.mtime + 100;
-    emu.rf.pc = 0x400;
+    h->mtimecmp = emu.mtime + 100;
+    h->rf.pc = 0x400;
     emu_step(&emu, &inst);
-    TRAP_CHECK((emu.csr.mip & MIP_MTIP) == 0, "MTIP clears when mtimecmp moves");
+    TRAP_CHECK((h->csr.mip & MIP_MTIP) == 0, "MTIP clears when mtimecmp moves");
 
     /* ---------- 6. 未安装 handler: 保持旧的未处理异常路径 ---------- */
     printf("\n── no handler installed ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.rf.pc = 0x80;
+    h->state = EMU_RUNNING;
+    h->rf.pc = 0x80;
     emu.mem.data[0x80] = 0xFF; emu.mem.data[0x81] = 0xFF;
     emu.mem.data[0x82] = 0xFF; emu.mem.data[0x83] = 0xFF;
     ok = emu_step(&emu, &inst);
-    TRAP_CHECK(!ok && emu.state == EMU_EXCEPTION,
+    TRAP_CHECK(!ok && h->state == EMU_EXCEPTION,
                "no mtvec → illegal instruction is fatal");
 
     (void)val;
@@ -329,6 +322,7 @@ static u32 enc_csrrs(u32 rd, u32 csr)
 void trap_smode_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     decoded_inst_t inst;
 
     trap_pass = 0;
@@ -343,112 +337,112 @@ void trap_smode_selftest(void)
     /* ---------- 1. U 态 ecall 委托给 S 态 ---------- */
     printf("── delegated ecall: U → S ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.priv = PRIV_U;
-    emu.csr.medeleg = 1u << EXC_ECALL_U;
-    emu.csr.stvec = 0x500;
-    emu.csr.mtvec = 0;
-    emu.csr.mstatus = MSTATUS_SIE;          /* 进 S handler 前 SIE 是开的 */
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_U;
+    h->csr.medeleg = 1u << EXC_ECALL_U;
+    h->csr.stvec = 0x500;
+    h->csr.mtvec = 0;
+    h->csr.mstatus = MSTATUS_SIE;          /* 进 S handler 前 SIE 是开的 */
     put32(&emu, 0x40, 0x00000073u);         /* ecall */
-    emu.rf.pc = 0x40;
+    h->rf.pc = 0x40;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x500, "pc = stvec (not mtvec)");
-    TRAP_CHECK(emu.csr.scause == EXC_ECALL_U, "scause = 8");
-    TRAP_CHECK(emu.csr.sepc == 0x40, "sepc = faulting pc");
-    TRAP_CHECK(emu.priv == PRIV_S, "handler runs in S-mode");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SPP) == 0, "SPP = U (came from U)");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SIE) == 0, "SIE cleared in handler");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SPIE) != 0, "SPIE saved SIE");
+    TRAP_CHECK(h->rf.pc == 0x500, "pc = stvec (not mtvec)");
+    TRAP_CHECK(h->csr.scause == EXC_ECALL_U, "scause = 8");
+    TRAP_CHECK(h->csr.sepc == 0x40, "sepc = faulting pc");
+    TRAP_CHECK(h->priv == PRIV_S, "handler runs in S-mode");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SPP) == 0, "SPP = U (came from U)");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SIE) == 0, "SIE cleared in handler");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SPIE) != 0, "SPIE saved SIE");
 
     /* ---------- 2. sret 回到 U 态 ---------- */
     printf("\n── sret restores state ──\n");
-    emu.csr.sepc = 0x44;
+    h->csr.sepc = 0x44;
     put32(&emu, 0x500, 0x10200073u);        /* sret */
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x44, "sret returns to sepc");
-    TRAP_CHECK(emu.priv == PRIV_U, "back to U-mode");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SIE) != 0, "SIE restored from SPIE");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SPIE) != 0, "SPIE forced to 1");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_SPP) == 0, "SPP cleared");
+    TRAP_CHECK(h->rf.pc == 0x44, "sret returns to sepc");
+    TRAP_CHECK(h->priv == PRIV_U, "back to U-mode");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SIE) != 0, "SIE restored from SPIE");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SPIE) != 0, "SPIE forced to 1");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SPP) == 0, "SPP cleared");
 
     /* ---------- 3. 没有委托的 S 态 ecall 進 M 态 ---------- */
     printf("\n── S ecall without delegation → M ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.priv = PRIV_S;
-    emu.csr.mtvec = 0x600;
-    emu.csr.stvec = 0x500;
-    emu.csr.medeleg = 0;
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_S;
+    h->csr.mtvec = 0x600;
+    h->csr.stvec = 0x500;
+    h->csr.medeleg = 0;
     put32(&emu, 0x100, 0x00000073u);
-    emu.rf.pc = 0x100;
+    h->rf.pc = 0x100;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x600, "pc = mtvec");
-    TRAP_CHECK(emu.csr.mcause == EXC_ECALL_S, "mcause = 9");
-    TRAP_CHECK((emu.csr.mstatus & MSTATUS_MPP_MASK) == MSTATUS_MPP_S,
+    TRAP_CHECK(h->rf.pc == 0x600, "pc = mtvec");
+    TRAP_CHECK(h->csr.mcause == EXC_ECALL_S, "mcause = 9");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MPP_MASK) == MSTATUS_MPP_S,
                "MPP = S");
-    TRAP_CHECK(emu.priv == PRIV_M, "handler runs in M-mode");
+    TRAP_CHECK(h->priv == PRIV_M, "handler runs in M-mode");
 
     put32(&emu, 0x600, 0x30200073u);        /* mret */
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x100, "mret returns to S-mode pc");
-    TRAP_CHECK(emu.priv == PRIV_S, "back to S-mode");
+    TRAP_CHECK(h->rf.pc == 0x100, "mret returns to S-mode pc");
+    TRAP_CHECK(h->priv == PRIV_S, "back to S-mode");
 
     /* ---------- 4. U 态非法指令委托给 S ---------- */
     printf("\n── delegated illegal instruction ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.priv = PRIV_U;
-    emu.csr.medeleg = 1u << EXC_ILLEGAL_INST;
-    emu.csr.stvec = 0x500;
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_U;
+    h->csr.medeleg = 1u << EXC_ILLEGAL_INST;
+    h->csr.stvec = 0x500;
     put32(&emu, 0x80, 0xFFFFFFFFu);
-    emu.rf.pc = 0x80;
+    h->rf.pc = 0x80;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x500, "illegal → S handler");
-    TRAP_CHECK(emu.csr.scause == EXC_ILLEGAL_INST, "scause = 2");
-    TRAP_CHECK(emu.csr.stval == 0xFFFFFFFFu, "stval = instruction bits");
+    TRAP_CHECK(h->rf.pc == 0x500, "illegal → S handler");
+    TRAP_CHECK(h->csr.scause == EXC_ILLEGAL_INST, "scause = 2");
+    TRAP_CHECK(h->csr.stval == 0xFFFFFFFFu, "stval = instruction bits");
 
     /* ---------- 5. CSR 权限: U 不能读 sstatus, S 可以 ---------- */
     printf("\n── CSR privilege ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
-    emu.priv = PRIV_U;
-    emu.csr.medeleg = 1u << EXC_ILLEGAL_INST;
-    emu.csr.stvec = 0x500;
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_U;
+    h->csr.medeleg = 1u << EXC_ILLEGAL_INST;
+    h->csr.stvec = 0x500;
     put32(&emu, 0x200, enc_csrrs(5, CSR_SSTATUS));
-    emu.rf.pc = 0x200;
+    h->rf.pc = 0x200;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x500, "U reading sstatus → illegal → S");
-    TRAP_CHECK(emu.csr.scause == EXC_ILLEGAL_INST, "scause = 2");
+    TRAP_CHECK(h->rf.pc == 0x500, "U reading sstatus → illegal → S");
+    TRAP_CHECK(h->csr.scause == EXC_ILLEGAL_INST, "scause = 2");
 
-    emu.priv = PRIV_S;
-    emu.rf.pc = 0x200;
+    h->priv = PRIV_S;
+    h->rf.pc = 0x200;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x204, "S reading sstatus is allowed");
-    TRAP_CHECK(emu.rf.regs[5] == (emu.csr.mstatus & SSTATUS_MASK),
+    TRAP_CHECK(h->rf.pc == 0x204, "S reading sstatus is allowed");
+    TRAP_CHECK(h->rf.regs[5] == (h->csr.mstatus & SSTATUS_MASK),
                "sstatus read returns the S view");
 
     /* ---------- 6. sfence.vma: S 可以, U 不可以 ---------- */
     printf("\n── sfence.vma privilege ──\n");
     put32(&emu, 0x300, 0x12000073u);
-    emu.priv = PRIV_S;
-    emu.rf.pc = 0x300;
+    h->priv = PRIV_S;
+    h->rf.pc = 0x300;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x304, "S executes sfence.vma");
+    TRAP_CHECK(h->rf.pc == 0x304, "S executes sfence.vma");
 
-    emu.priv = PRIV_U;
-    emu.rf.pc = 0x300;
+    h->priv = PRIV_U;
+    h->rf.pc = 0x300;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x500, "U executing sfence.vma → illegal → S");
-    TRAP_CHECK(emu.csr.scause == EXC_ILLEGAL_INST, "scause = 2");
+    TRAP_CHECK(h->rf.pc == 0x500, "U executing sfence.vma → illegal → S");
+    TRAP_CHECK(h->csr.scause == EXC_ILLEGAL_INST, "scause = 2");
 
     /* ---------- 7. sret 不能在 U 态执行 ---------- */
     printf("\n── sret privilege ──\n");
     put32(&emu, 0x400, 0x10200073u);
-    emu.priv = PRIV_U;
-    emu.rf.pc = 0x400;
+    h->priv = PRIV_U;
+    h->rf.pc = 0x400;
     emu_step(&emu, &inst);
-    TRAP_CHECK(emu.rf.pc == 0x500, "U executing sret → illegal → S");
-    TRAP_CHECK(emu.csr.scause == EXC_ILLEGAL_INST, "scause = 2");
+    TRAP_CHECK(h->rf.pc == 0x500, "U executing sret → illegal → S");
+    TRAP_CHECK(h->csr.scause == EXC_ILLEGAL_INST, "scause = 2");
 
     printf("\n  Result: %d passed, %d failed\n", trap_pass, trap_fail);
 }

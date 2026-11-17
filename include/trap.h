@@ -19,8 +19,12 @@
 #include "types.h"
 #include "emu.h"
 
-/** 初始化 trap 相关状态 (mstatus 复位值等) */
-void trap_init(emulator_t *emu);
+/*
+ * v0.12: trap 状态全部下沉到 hart_t, 由 emu_init_harts() 统一复位:
+ *   - mstatus 复位成 FS = Initial
+ *   - mtimecmp = 0 (定时器关闭)
+ *   - mtime 是全机器共享的, 放在 emulator_t 里
+ */
 
 /**
  * @brief 进入 trap

@@ -27,8 +27,10 @@
 - **Sv32 分页** — 两级页表（4KB 页 + 4MB 大页）、satp、PTE 权限位（V/R/W/X/U/A/D）、取指/读/写三类缺页（mcause 12/13/15）
 - **U 态** — M/U 两级特权，MPP/MPIE 保存与恢复，`mret` 回 U 态；U 态访问 M 态 CSR、执行 `mret`/`sfence.vma` 都按非法指令陷入
 - **S 态与异常委托** — S 态 CSR（sstatus/sie/stvec/sscratch/sepc/scause/stval/sip）、`sret`、`medeleg`/`mideleg`；当前级不高于 S 且对应委托位为 1 的 trap 直接进 `stvec`，否则进 `mtvec`；S 态默认不能访问 U 页，打开 `mstatus.SUM` 后可以读写但仍不能取指
-- **简化 CLINT** — `mtime` / `mtimecmp`（地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 297 项，`make test` 全过
+- **多 hart（v0.12）** — 最多 4 个核，每个 hart 有自己的寄存器、CSR、特权级、LR/SC 保留集和 `mtimecmp`，共享同一块物理内存；所有 hart 从同一入口启动，用 `mhartid` 分流（和真机固件的做法一致）；`emu_run` 按轮转顺序交错执行，结果确定可复现
+- **跨核原子语义** — 任何一个 hart 的普通 store / AMO / SC 写到某地址，都会让所有 hart 里针对该地址的 LR 保留失效，双核下的 `lr/sc` 不丢更新
+- **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart 20 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 317 项，`make test` 全过
 
 ## 快速开始
 
@@ -67,6 +69,9 @@ make d-demo
 
 # mstatus.FS demo：关闭浮点 → 非法指令；开启 → 执行后变 Dirty
 make fs-demo
+
+# 双 hart demo：两个核各自读 mhartid 分流，用 amoadd 把共享计数器加到 50
+make multihart-demo
 
 # 在调试器里打开同一个程序
 make debug-demo

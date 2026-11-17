@@ -108,6 +108,7 @@ static int host_rounding(u32 rm, u32 frm)
 
 static void fp_collect_flags(emulator_t *emu)
 {
+    hart_t *h = emu_hart(emu);
     int e = fetestexcept(FE_ALL_EXCEPT);
     u32 f = 0;
 
@@ -117,7 +118,7 @@ static void fp_collect_flags(emulator_t *emu)
     if (e & FE_DIVBYZERO) f |= FP_DZ;
     if (e & FE_INVALID)   f |= FP_NV;
 
-    emu->csr.fflags |= f;
+    h->csr.fflags |= f;
 }
 
 /* =========================== 算术 =========================== */
@@ -132,12 +133,13 @@ enum {
 
 static u32 fp_arith(emulator_t *emu, u32 rm, int op, u32 abits, u32 bbits)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     float result;
     u32 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         /* volatile 保证运算真的发生在这里, 不被挪到改舍入模式之前 */
@@ -167,12 +169,13 @@ static u32 fp_arith(emulator_t *emu, u32 rm, int op, u32 abits, u32 bbits)
 
 static u64 fp_arith_d(emulator_t *emu, u32 rm, int op, u64 abits, u64 bbits)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     double result;
     u64 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile double a = bits_to_f64(abits);
@@ -218,6 +221,7 @@ static u64 fp_arith_d(emulator_t *emu, u32 rm, int op, u64 abits, u64 bbits)
 static u32 fp_fma_s(emulator_t *emu, u32 rm, u32 abits, u32 bbits,
                     u32 cbits, int neg_a, int neg_c)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     float result;
     u32 bits;
@@ -226,7 +230,7 @@ static u32 fp_fma_s(emulator_t *emu, u32 rm, u32 abits, u32 bbits,
     if (neg_c) cbits ^= 0x80000000u;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile float a = bits_to_f32(abits);
@@ -249,6 +253,7 @@ static u32 fp_fma_s(emulator_t *emu, u32 rm, u32 abits, u32 bbits,
 static u64 fp_fma_d(emulator_t *emu, u32 rm, u64 abits, u64 bbits,
                     u64 cbits, int neg_a, int neg_c)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     double result;
     u64 bits;
@@ -257,7 +262,7 @@ static u64 fp_fma_d(emulator_t *emu, u32 rm, u64 abits, u64 bbits,
     if (neg_c) cbits ^= 0x8000000000000000ull;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile double a = bits_to_f64(abits);
@@ -281,6 +286,7 @@ static u64 fp_fma_d(emulator_t *emu, u32 rm, u64 abits, u64 bbits,
 
 static u32 fp_minmax(emulator_t *emu, u32 abits, u32 bbits, int is_max)
 {
+    hart_t *h = emu_hart(emu);
     int a_nan = bits_is_nan(abits);
     int b_nan = bits_is_nan(bbits);
 
@@ -288,11 +294,11 @@ static u32 fp_minmax(emulator_t *emu, u32 abits, u32 bbits, int is_max)
         return FP_CANON_NAN;
     }
     if (a_nan) {
-        if (bits_is_snan(abits)) emu->csr.fflags |= FP_NV;
+        if (bits_is_snan(abits)) h->csr.fflags |= FP_NV;
         return bbits;
     }
     if (b_nan) {
-        if (bits_is_snan(bbits)) emu->csr.fflags |= FP_NV;
+        if (bits_is_snan(bbits)) h->csr.fflags |= FP_NV;
         return abits;
     }
 
@@ -320,17 +326,18 @@ static u32 fp_minmax(emulator_t *emu, u32 abits, u32 bbits, int is_max)
 
 static u32 fp_compare(emulator_t *emu, u8 funct3, u32 abits, u32 bbits)
 {
+    hart_t *h = emu_hart(emu);
     float a, b;
 
     if (bits_is_nan(abits) || bits_is_nan(bbits)) {
         if (funct3 == 2u) {
             /* FEQ 是 quiet 比较, 只有 sNaN 才置 NV */
             if (bits_is_snan(abits) || bits_is_snan(bbits)) {
-                emu->csr.fflags |= FP_NV;
+                h->csr.fflags |= FP_NV;
             }
         } else {
             /* FLT / FLE 是 signaling 比较, 任何 NaN 都置 NV */
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
         }
         return 0;
     }
@@ -349,6 +356,7 @@ static u32 fp_compare(emulator_t *emu, u8 funct3, u32 abits, u32 bbits)
 
 static u64 fp_minmax_d(emulator_t *emu, u64 abits, u64 bbits, int is_max)
 {
+    hart_t *h = emu_hart(emu);
     int a_nan = bits64_is_nan(abits);
     int b_nan = bits64_is_nan(bbits);
 
@@ -356,11 +364,11 @@ static u64 fp_minmax_d(emulator_t *emu, u64 abits, u64 bbits, int is_max)
         return FP_CANON_NAN64;
     }
     if (a_nan) {
-        if (bits64_is_snan(abits)) emu->csr.fflags |= FP_NV;
+        if (bits64_is_snan(abits)) h->csr.fflags |= FP_NV;
         return bbits;
     }
     if (b_nan) {
-        if (bits64_is_snan(bbits)) emu->csr.fflags |= FP_NV;
+        if (bits64_is_snan(bbits)) h->csr.fflags |= FP_NV;
         return abits;
     }
 
@@ -381,15 +389,16 @@ static u64 fp_minmax_d(emulator_t *emu, u64 abits, u64 bbits, int is_max)
 
 static u32 fp_compare_d(emulator_t *emu, u8 funct3, u64 abits, u64 bbits)
 {
+    hart_t *h = emu_hart(emu);
     double a, b;
 
     if (bits64_is_nan(abits) || bits64_is_nan(bbits)) {
         if (funct3 == 2u) {
             if (bits64_is_snan(abits) || bits64_is_snan(bbits)) {
-                emu->csr.fflags |= FP_NV;
+                h->csr.fflags |= FP_NV;
             }
         } else {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
         }
         return 0;
     }
@@ -414,42 +423,43 @@ static u32 fp_compare_d(emulator_t *emu, u8 funct3, u64 abits, u64 bbits)
  */
 static u32 fp_float_to_int(emulator_t *emu, u32 rm, u32 abits, int is_unsigned)
 {
+    hart_t *h = emu_hart(emu);
     float a = bits_to_f32(abits);
     double d = (double)a;
     int old_rm;
     float rounded;
 
     if (bits_is_nan(abits)) {
-        emu->csr.fflags |= FP_NV;
+        h->csr.fflags |= FP_NV;
         return is_unsigned ? 0xFFFFFFFFu : 0x7FFFFFFFu;
     }
 
     if (is_unsigned) {
         if (!(d > 0.0)) {
             if (d < 0.0) {
-                emu->csr.fflags |= FP_NV;
+                h->csr.fflags |= FP_NV;
                 return 0;           /* 负数转 unsigned: 0 + NV */
             }
             return 0;               /* +0 / -0 */
         }
         if (d >= 4294967296.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0xFFFFFFFFu;
         }
     } else {
         if (d >= 2147483648.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0x7FFFFFFFu;
         }
         if (d < -2147483648.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0x80000000u;
         }
     }
 
     old_rm = fegetround();
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile float va = a;
@@ -461,7 +471,7 @@ static u32 fp_float_to_int(emulator_t *emu, u32 rm, u32 abits, int is_unsigned)
 
     /* nearbyint 不报 inexact, 这里自己比一次 */
     if ((double)rounded != d) {
-        emu->csr.fflags |= FP_NX;
+        h->csr.fflags |= FP_NX;
     }
 
     return is_unsigned ? (u32)rounded : (u32)(s32)rounded;
@@ -470,12 +480,13 @@ static u32 fp_float_to_int(emulator_t *emu, u32 rm, u32 abits, int is_unsigned)
 /* FCVT.S.W / FCVT.S.WU */
 static u32 fp_int_to_float(emulator_t *emu, u32 rm, u32 value, int is_unsigned)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     float result;
     u32 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile u32 v = value;
@@ -501,41 +512,42 @@ static u32 fp_int_to_float(emulator_t *emu, u32 rm, u32 value, int is_unsigned)
 /* FCVT.W.D / FCVT.WU.D */
 static u32 fp_double_to_int(emulator_t *emu, u32 rm, u64 abits, int is_unsigned)
 {
+    hart_t *h = emu_hart(emu);
     double d = bits_to_f64(abits);
     int old_rm;
     double rounded;
 
     if (bits64_is_nan(abits)) {
-        emu->csr.fflags |= FP_NV;
+        h->csr.fflags |= FP_NV;
         return is_unsigned ? 0xFFFFFFFFu : 0x7FFFFFFFu;
     }
 
     if (is_unsigned) {
         if (!(d > 0.0)) {
             if (d < 0.0) {
-                emu->csr.fflags |= FP_NV;
+                h->csr.fflags |= FP_NV;
                 return 0;
             }
             return 0;
         }
         if (d >= 4294967296.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0xFFFFFFFFu;
         }
     } else {
         if (d >= 2147483648.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0x7FFFFFFFu;
         }
         if (d < -2147483648.0) {
-            emu->csr.fflags |= FP_NV;
+            h->csr.fflags |= FP_NV;
             return 0x80000000u;
         }
     }
 
     old_rm = fegetround();
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile double vd = d;
@@ -546,7 +558,7 @@ static u32 fp_double_to_int(emulator_t *emu, u32 rm, u64 abits, int is_unsigned)
     fp_collect_flags(emu);
 
     if (rounded != d) {
-        emu->csr.fflags |= FP_NX;
+        h->csr.fflags |= FP_NX;
     }
 
     return is_unsigned ? (u32)rounded : (u32)(s32)rounded;
@@ -555,12 +567,13 @@ static u32 fp_double_to_int(emulator_t *emu, u32 rm, u64 abits, int is_unsigned)
 /* FCVT.D.W / FCVT.D.WU */
 static u64 fp_int_to_double(emulator_t *emu, u32 rm, u32 value, int is_unsigned)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     double result;
     u64 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile u32 v = value;
@@ -584,12 +597,13 @@ static u64 fp_int_to_double(emulator_t *emu, u32 rm, u32 value, int is_unsigned)
 /* FCVT.D.S: float → double, 精确转换 */
 static u64 fp_f32_to_f64(emulator_t *emu, u32 rm, u32 abits)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     double result;
     u64 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile float a = bits_to_f32(abits);
@@ -610,12 +624,13 @@ static u64 fp_f32_to_f64(emulator_t *emu, u32 rm, u32 abits)
 /* FCVT.S.D: double → float, 结果按单精度 NaN-box 存 */
 static u64 fp_f64_to_f32(emulator_t *emu, u32 rm, u64 abits)
 {
+    hart_t *h = emu_hart(emu);
     int old_rm = fegetround();
     float result;
     u32 bits;
 
     feclearexcept(FE_ALL_EXCEPT);
-    fesetround(host_rounding(rm, emu->csr.frm));
+    fesetround(host_rounding(rm, h->csr.frm));
 
     {
         volatile double a = bits_to_f64(abits);
@@ -681,13 +696,14 @@ static u32 fp_classify64(u64 bits)
 
 bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
 {
+    hart_t *h = emu_hart(emu);
     u8 f3   = inst->funct3;
     u8 f7   = inst->funct7;
     u8 rd   = inst->rd;
     u8 rs1  = inst->rs1;
     u8 rs2  = inst->rs2;
-    u64 ra  = emu->rf.fregs[rs1];
-    u64 rb  = emu->rf.fregs[rs2];
+    u64 ra  = h->rf.fregs[rs1];
+    u64 rb  = h->rf.fregs[rs2];
     u32 a   = fp32_unbox(ra);       /* 单精度操作数, 未 box 的读作规范 NaN */
     u32 b   = fp32_unbox(rb);
     u32 out;
@@ -713,12 +729,12 @@ bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
         if (inst->opcode == OP_FNMADD) { neg_a = 1; neg_c = 1; }
 
         if (fmt == 0u) {
-            emu->rf.fregs[rd] = fp32_box(fp_fma_s(
-                emu, f3, a, b, fp32_unbox(emu->rf.fregs[rs3]),
+            h->rf.fregs[rd] = fp32_box(fp_fma_s(
+                emu, f3, a, b, fp32_unbox(h->rf.fregs[rs3]),
                 neg_a, neg_c));
         } else {
-            emu->rf.fregs[rd] = fp_fma_d(
-                emu, f3, ra, rb, emu->rf.fregs[rs3], neg_a, neg_c);
+            h->rf.fregs[rd] = fp_fma_d(
+                emu, f3, ra, rb, h->rf.fregs[rs3], neg_a, neg_c);
         }
         return true;
     }
@@ -726,38 +742,38 @@ bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
     switch (f7) {
     /* ---------------- 单精度算术 (S) ---------------- */
     case 0x00:      /* FADD.S */
-        emu->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_ADD, a, b));
+        h->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_ADD, a, b));
         return true;
     case 0x04:      /* FSUB.S */
-        emu->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_SUB, a, b));
+        h->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_SUB, a, b));
         return true;
     case 0x08:      /* FMUL.S */
-        emu->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_MUL, a, b));
+        h->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_MUL, a, b));
         return true;
     case 0x0C:      /* FDIV.S */
-        emu->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_DIV, a, b));
+        h->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_DIV, a, b));
         return true;
     case 0x2C:      /* FSQRT.S, rs2 必须为 0 */
         if (rs2 != 0u) return false;
-        emu->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_SQRT, a, 0));
+        h->rf.fregs[rd] = fp32_box(fp_arith(emu, f3, FP_SQRT, a, 0));
         return true;
 
     /* ---------------- 双精度算术 (D) ---------------- */
     case 0x01:      /* FADD.D */
-        emu->rf.fregs[rd] = fp_arith_d(emu, f3, FP_ADD, ra, rb);
+        h->rf.fregs[rd] = fp_arith_d(emu, f3, FP_ADD, ra, rb);
         return true;
     case 0x05:      /* FSUB.D */
-        emu->rf.fregs[rd] = fp_arith_d(emu, f3, FP_SUB, ra, rb);
+        h->rf.fregs[rd] = fp_arith_d(emu, f3, FP_SUB, ra, rb);
         return true;
     case 0x09:      /* FMUL.D */
-        emu->rf.fregs[rd] = fp_arith_d(emu, f3, FP_MUL, ra, rb);
+        h->rf.fregs[rd] = fp_arith_d(emu, f3, FP_MUL, ra, rb);
         return true;
     case 0x0D:      /* FDIV.D */
-        emu->rf.fregs[rd] = fp_arith_d(emu, f3, FP_DIV, ra, rb);
+        h->rf.fregs[rd] = fp_arith_d(emu, f3, FP_DIV, ra, rb);
         return true;
     case 0x2D:      /* FSQRT.D, rs2 必须为 0 */
         if (rs2 != 0u) return false;
-        emu->rf.fregs[rd] = fp_arith_d(emu, f3, FP_SQRT, ra, 0);
+        h->rf.fregs[rd] = fp_arith_d(emu, f3, FP_SQRT, ra, 0);
         return true;
 
     /* ---------------- 符号注入 ---------------- */
@@ -771,18 +787,18 @@ bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
         } else {
             return false;
         }
-        emu->rf.fregs[rd] = fp32_box(out);
+        h->rf.fregs[rd] = fp32_box(out);
         return true;
 
     case 0x11:      /* FSGNJ.D / FSGNJN.D / FSGNJX.D */
         if (f3 == 0u) {
-            emu->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
+            h->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
                                 (rb & 0x8000000000000000ull);
         } else if (f3 == 1u) {
-            emu->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
+            h->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
                                 ((~rb) & 0x8000000000000000ull);
         } else if (f3 == 2u) {
-            emu->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
+            h->rf.fregs[rd] = (ra & 0x7FFFFFFFFFFFFFFFull) |
                                 ((ra ^ rb) & 0x8000000000000000ull);
         } else {
             return false;
@@ -792,81 +808,81 @@ bool fpu_execute(emulator_t *emu, decoded_inst_t *inst)
     /* ---------------- min / max ---------------- */
     case 0x14:      /* FMIN.S / FMAX.S */
         if (f3 > 1u) return false;
-        emu->rf.fregs[rd] = fp32_box(fp_minmax(emu, a, b, f3 == 1u));
+        h->rf.fregs[rd] = fp32_box(fp_minmax(emu, a, b, f3 == 1u));
         return true;
 
     case 0x15:      /* FMIN.D / FMAX.D */
         if (f3 > 1u) return false;
-        emu->rf.fregs[rd] = fp_minmax_d(emu, ra, rb, f3 == 1u);
+        h->rf.fregs[rd] = fp_minmax_d(emu, ra, rb, f3 == 1u);
         return true;
 
     /* ---------------- 比较 ---------------- */
     case 0x50:      /* FLE.S / FLT.S / FEQ.S */
         if (f3 > 2u) return false;
-        reg_write(&emu->rf, rd, fp_compare(emu, f3, a, b));
+        reg_write(&h->rf, rd, fp_compare(emu, f3, a, b));
         return true;
 
     case 0x51:      /* FLE.D / FLT.D / FEQ.D */
         if (f3 > 2u) return false;
-        reg_write(&emu->rf, rd, fp_compare_d(emu, f3, ra, rb));
+        reg_write(&h->rf, rd, fp_compare_d(emu, f3, ra, rb));
         return true;
 
     /* ---------------- 浮点 → 整数 ---------------- */
     case 0x60:      /* FCVT.W.S / FCVT.WU.S */
         if (rs2 > 1u) return false;
-        reg_write(&emu->rf, rd, fp_float_to_int(emu, f3, a, rs2 == 1u));
+        reg_write(&h->rf, rd, fp_float_to_int(emu, f3, a, rs2 == 1u));
         return true;
 
     case 0x61:      /* FCVT.W.D / FCVT.WU.D */
         if (rs2 > 1u) return false;
-        reg_write(&emu->rf, rd, fp_double_to_int(emu, f3, ra, rs2 == 1u));
+        reg_write(&h->rf, rd, fp_double_to_int(emu, f3, ra, rs2 == 1u));
         return true;
 
     /* ---------------- 整数 → 浮点 ---------------- */
     case 0x68:      /* FCVT.S.W / FCVT.S.WU */
         if (rs2 > 1u) return false;
-        emu->rf.fregs[rd] = fp32_box(fp_int_to_float(
-            emu, f3, reg_read(&emu->rf, rs1), rs2 == 1u));
+        h->rf.fregs[rd] = fp32_box(fp_int_to_float(
+            emu, f3, reg_read(&h->rf, rs1), rs2 == 1u));
         return true;
 
     case 0x69:      /* FCVT.D.W / FCVT.D.WU */
         if (rs2 > 1u) return false;
-        emu->rf.fregs[rd] = fp_int_to_double(
-            emu, f3, reg_read(&emu->rf, rs1), rs2 == 1u);
+        h->rf.fregs[rd] = fp_int_to_double(
+            emu, f3, reg_read(&h->rf, rs1), rs2 == 1u);
         return true;
 
     /* ---------------- 单精度 <-> 双精度 ---------------- */
     case 0x20:      /* FCVT.S.D: fmt=00(S), rs2=01(D) */
         if (rs2 != 1u) return false;
-        emu->rf.fregs[rd] = fp_f64_to_f32(emu, f3, ra);
+        h->rf.fregs[rd] = fp_f64_to_f32(emu, f3, ra);
         return true;
 
     case 0x21:      /* FCVT.D.S: fmt=01(D), rs2=00(S) */
         if (rs2 != 0u) return false;
-        emu->rf.fregs[rd] = fp_f32_to_f64(emu, f3, a);
+        h->rf.fregs[rd] = fp_f32_to_f64(emu, f3, a);
         return true;
 
     /* ---------------- 移动 / 分类 ---------------- */
     case 0x70:      /* FMV.X.W / FCLASS.S */
         if (rs2 != 0u) return false;
         if (f3 == 0u) {
-            reg_write(&emu->rf, rd, (u32)ra);   /* 原始低 32 位 */
+            reg_write(&h->rf, rd, (u32)ra);   /* 原始低 32 位 */
             return true;
         }
         if (f3 == 1u) {
-            reg_write(&emu->rf, rd, fp_classify(a));
+            reg_write(&h->rf, rd, fp_classify(a));
             return true;
         }
         return false;
 
     case 0x71:      /* FCLASS.D (RV32D 没有 FMV.X.D) */
         if (rs2 != 0u || f3 != 1u) return false;
-        reg_write(&emu->rf, rd, fp_classify64(ra));
+        reg_write(&h->rf, rd, fp_classify64(ra));
         return true;
 
     case 0x78:      /* FMV.W.X */
         if (rs2 != 0u || f3 != 0u) return false;
-        emu->rf.fregs[rd] = fp32_box(reg_read(&emu->rf, rs1));
+        h->rf.fregs[rd] = fp32_box(reg_read(&h->rf, rs1));
         return true;
 
     default:
@@ -941,6 +957,7 @@ static u64 sf32(u32 bits)
 void fpu_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     int pass = 0, fail = 0;
     u32 base = 0x0000;
     u32 bits;
@@ -954,7 +971,7 @@ void fpu_selftest(void)
     /* ---------------- FLW / FSW ---------------- */
     printf("── FLW / FSW ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     memory_write32(&emu.mem, 0x100, 0x3FC00000u);     /* 1.5f */
 
@@ -964,23 +981,23 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 12, 0x0040A183);  /* lw x3, 4(x1) */
     mem_write_inst(&emu.mem, base + 16, 0x00000073);  /* ecall */
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 5);
 
-    CHECK(emu.rf.fregs[1] == sf32(0x3FC00000u), "flw f1 = 1.5f");
-    CHECK(reg_read(&emu.rf, 3) == 0x3FC00000u, "fsw wrote 1.5f back to memory");
+    CHECK(h->rf.fregs[1] == sf32(0x3FC00000u), "flw f1 = 1.5f");
+    CHECK(reg_read(&h->rf, 3) == 0x3FC00000u, "fsw wrote 1.5f back to memory");
     emu_free(&emu);
 
     /* ---------------- FADD / FSUB / FMUL / FDIV / FSQRT ---------------- */
     printf("── arithmetic ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3FC00000u);   /* 1.5 */
-    emu.rf.fregs[2] = sf32(0x40100000u);   /* 2.25 */
-    emu.rf.fregs[3] = sf32(0x40A00000u);   /* 5.0 */
-    emu.rf.fregs[4] = sf32(0x40000000u);   /* 2.0 */
-    emu.rf.fregs[5] = sf32(0x41100000u);   /* 9.0 */
+    h->rf.fregs[1] = sf32(0x3FC00000u);   /* 1.5 */
+    h->rf.fregs[2] = sf32(0x40100000u);   /* 2.25 */
+    h->rf.fregs[3] = sf32(0x40A00000u);   /* 5.0 */
+    h->rf.fregs[4] = sf32(0x40000000u);   /* 2.0 */
+    h->rf.fregs[5] = sf32(0x41100000u);   /* 9.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x00, 2, 1, 0, 10)); /* fadd f10,f1,f2 */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x04, 2, 3, 0, 11)); /* fsub f11,f3,f2 */
@@ -989,24 +1006,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fp(0x2C, 0, 5, 0, 14)); /* fsqrt f14,f5 */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[10] == sf32(0x40700000u), "fadd 1.5+2.25 = 3.75");
-    CHECK(emu.rf.fregs[11] == sf32(0x40300000u), "fsub 5.0-2.25 = 2.75");
-    CHECK(emu.rf.fregs[12] == sf32(0x40580000u), "fmul 1.5*2.25 = 3.375");
-    CHECK(emu.rf.fregs[13] == sf32(0x40200000u), "fdiv 5.0/2.0 = 2.5");
-    CHECK(emu.rf.fregs[14] == sf32(0x40400000u), "fsqrt 9.0 = 3.0");
+    CHECK(h->rf.fregs[10] == sf32(0x40700000u), "fadd 1.5+2.25 = 3.75");
+    CHECK(h->rf.fregs[11] == sf32(0x40300000u), "fsub 5.0-2.25 = 2.75");
+    CHECK(h->rf.fregs[12] == sf32(0x40580000u), "fmul 1.5*2.25 = 3.375");
+    CHECK(h->rf.fregs[13] == sf32(0x40200000u), "fdiv 5.0/2.0 = 2.5");
+    CHECK(h->rf.fregs[14] == sf32(0x40400000u), "fsqrt 9.0 = 3.0");
     emu_free(&emu);
 
     /* ---------------- FSGNJ / FMIN / FMAX ---------------- */
     printf("── sign inject / min / max ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3F800000u);   /* +1.0 */
-    emu.rf.fregs[2] = sf32(0x80000000u);   /* -0.0 */
-    emu.rf.fregs[3] = sf32(0x00000000u);   /* +0.0 */
+    h->rf.fregs[1] = sf32(0x3F800000u);   /* +1.0 */
+    h->rf.fregs[2] = sf32(0x80000000u);   /* -0.0 */
+    h->rf.fregs[3] = sf32(0x00000000u);   /* +0.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x10, 2, 1, 0, 10)); /* fsgnj  */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x10, 2, 1, 1, 11)); /* fsgnjn */
@@ -1015,24 +1032,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fp(0x14, 3, 2, 1, 14)); /* fmax -0,+0 */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[10] == sf32(0xBF800000u), "fsgnj  +1.0 <- -0.0 sign = -1.0");
-    CHECK(emu.rf.fregs[11] == sf32(0x3F800000u), "fsgnjn +1.0 <- -0.0 sign = +1.0");
-    CHECK(emu.rf.fregs[12] == sf32(0xBF800000u), "fsgnjx +1.0 ^ -0.0 sign = -1.0");
-    CHECK(emu.rf.fregs[13] == sf32(0x80000000u), "fmin(-0.0, +0.0) = -0.0");
-    CHECK(emu.rf.fregs[14] == sf32(0x00000000u), "fmax(-0.0, +0.0) = +0.0");
+    CHECK(h->rf.fregs[10] == sf32(0xBF800000u), "fsgnj  +1.0 <- -0.0 sign = -1.0");
+    CHECK(h->rf.fregs[11] == sf32(0x3F800000u), "fsgnjn +1.0 <- -0.0 sign = +1.0");
+    CHECK(h->rf.fregs[12] == sf32(0xBF800000u), "fsgnjx +1.0 ^ -0.0 sign = -1.0");
+    CHECK(h->rf.fregs[13] == sf32(0x80000000u), "fmin(-0.0, +0.0) = -0.0");
+    CHECK(h->rf.fregs[14] == sf32(0x00000000u), "fmax(-0.0, +0.0) = +0.0");
     emu_free(&emu);
 
     /* ---------------- 比较 ---------------- */
     printf("── compare ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3F800000u);   /* 1.0 */
-    emu.rf.fregs[2] = sf32(0x40000000u);   /* 2.0 */
-    emu.rf.fregs[3] = sf32(0x7FC00000u);   /* qNaN */
+    h->rf.fregs[1] = sf32(0x3F800000u);   /* 1.0 */
+    h->rf.fregs[2] = sf32(0x40000000u);   /* 2.0 */
+    h->rf.fregs[3] = sf32(0x7FC00000u);   /* qNaN */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x50, 2, 1, 1, 10)); /* flt 1<2 */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x50, 2, 1, 0, 11)); /* fle 1<=2 */
@@ -1041,23 +1058,23 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fp(0x50, 3, 1, 1, 14)); /* flt qNaN */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(reg_read(&emu.rf, 10) == 1, "flt 1.0 < 2.0 = 1");
-    CHECK(reg_read(&emu.rf, 11) == 1, "fle 1.0 <= 2.0 = 1");
-    CHECK(reg_read(&emu.rf, 12) == 0, "feq 1.0 == 2.0 = 0");
-    CHECK(reg_read(&emu.rf, 13) == 0, "feq qNaN = 0");
-    CHECK(reg_read(&emu.rf, 14) == 0, "flt qNaN = 0");
+    CHECK(reg_read(&h->rf, 10) == 1, "flt 1.0 < 2.0 = 1");
+    CHECK(reg_read(&h->rf, 11) == 1, "fle 1.0 <= 2.0 = 1");
+    CHECK(reg_read(&h->rf, 12) == 0, "feq 1.0 == 2.0 = 0");
+    CHECK(reg_read(&h->rf, 13) == 0, "feq qNaN = 0");
+    CHECK(reg_read(&h->rf, 14) == 0, "flt qNaN = 0");
     emu_free(&emu);
 
     /* ---------------- 转换 ---------------- */
     printf("── fcvt ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x40700000u);   /* 3.75 */
-    emu.rf.fregs[2] = sf32(0xC0200000u);   /* -2.5 */
+    h->rf.fregs[1] = sf32(0x40700000u);   /* 3.75 */
+    h->rf.fregs[2] = sf32(0xC0200000u);   /* -2.5 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x60, 0, 1, 0, 10)); /* fcvt.w.s RNE */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x60, 0, 1, 1, 11)); /* fcvt.w.s RTZ */
@@ -1067,24 +1084,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 20, enc_fp(0x68, 0, 1, 0, 14)); /* fcvt.s.w f14, x1 */
     mem_write_inst(&emu.mem, base + 24, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 7);
 
-    CHECK(reg_read(&emu.rf, 10) == 4, "fcvt.w.s 3.75 RNE = 4");
-    CHECK(reg_read(&emu.rf, 11) == 3, "fcvt.w.s 3.75 RTZ = 3");
-    CHECK((s32)reg_read(&emu.rf, 12) == -2, "fcvt.w.s -2.5 RNE = -2");
-    CHECK((s32)reg_read(&emu.rf, 13) == -3, "fcvt.w.s -2.5 RDN = -3");
-    CHECK(emu.rf.fregs[14] == sf32(0x40E00000u), "fcvt.s.w 7 = 7.0f");
+    CHECK(reg_read(&h->rf, 10) == 4, "fcvt.w.s 3.75 RNE = 4");
+    CHECK(reg_read(&h->rf, 11) == 3, "fcvt.w.s 3.75 RTZ = 3");
+    CHECK((s32)reg_read(&h->rf, 12) == -2, "fcvt.w.s -2.5 RNE = -2");
+    CHECK((s32)reg_read(&h->rf, 13) == -3, "fcvt.w.s -2.5 RDN = -3");
+    CHECK(h->rf.fregs[14] == sf32(0x40E00000u), "fcvt.s.w 7 = 7.0f");
     emu_free(&emu);
 
     /* ---------------- FMV / FCLASS ---------------- */
     printf("── fmv / fclass ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x40490FDBu);   /* pi */
-    emu.rf.fregs[2] = sf32(0x7F800000u);   /* +inf */
-    emu.rf.fregs[3] = sf32(0x7FC00000u);   /* qNaN */
+    h->rf.fregs[1] = sf32(0x40490FDBu);   /* pi */
+    h->rf.fregs[2] = sf32(0x7F800000u);   /* +inf */
+    h->rf.fregs[3] = sf32(0x7FC00000u);   /* qNaN */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x70, 0, 1, 0, 10)); /* fmv.x.w */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x70, 0, 2, 1, 11)); /* fclass +inf */
@@ -1093,19 +1110,19 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fp(0x78, 0, 5, 0, 13)); /* fmv.w.x */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(reg_read(&emu.rf, 10) == 0x40490FDBu, "fmv.x.w keeps raw bits");
-    CHECK(reg_read(&emu.rf, 11) == (1u << 7), "fclass(+inf) = bit 7");
-    CHECK(reg_read(&emu.rf, 12) == (1u << 9), "fclass(qNaN) = bit 9");
-    CHECK(emu.rf.fregs[13] == sf32(0x3F800000u), "fmv.w.x keeps raw bits");
+    CHECK(reg_read(&h->rf, 10) == 0x40490FDBu, "fmv.x.w keeps raw bits");
+    CHECK(reg_read(&h->rf, 11) == (1u << 7), "fclass(+inf) = bit 7");
+    CHECK(reg_read(&h->rf, 12) == (1u << 9), "fclass(qNaN) = bit 9");
+    CHECK(h->rf.fregs[13] == sf32(0x3F800000u), "fmv.w.x keeps raw bits");
     emu_free(&emu);
 
     /* ---------------- RV32D: FLD / FSD ---------------- */
     printf("── RV32D load/store ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
     memory_write64(&emu.mem, 0x100, 0x3FF8000000000000ull);   /* 1.5 */
 
@@ -1116,24 +1133,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, 0x00C0A203);          /* lw x4, 12(x1) */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[1] == 0x3FF8000000000000ull, "fld f1 = 1.5 (double)");
-    CHECK(reg_read(&emu.rf, 3) == 0x00000000u &&
-          reg_read(&emu.rf, 4) == 0x3FF80000u, "fsd wrote 64 bits back");
+    CHECK(h->rf.fregs[1] == 0x3FF8000000000000ull, "fld f1 = 1.5 (double)");
+    CHECK(reg_read(&h->rf, 3) == 0x00000000u &&
+          reg_read(&h->rf, 4) == 0x3FF80000u, "fsd wrote 64 bits back");
     emu_free(&emu);
 
     /* ---------------- RV32D: 算术 ---------------- */
     printf("── RV32D arithmetic ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = 0x3FF8000000000000ull;   /* 1.5 */
-    emu.rf.fregs[2] = 0x4002000000000000ull;   /* 2.25 */
-    emu.rf.fregs[3] = 0x4014000000000000ull;   /* 5.0 */
-    emu.rf.fregs[4] = 0x4000000000000000ull;   /* 2.0 */
-    emu.rf.fregs[5] = 0x4022000000000000ull;   /* 9.0 */
+    h->rf.fregs[1] = 0x3FF8000000000000ull;   /* 1.5 */
+    h->rf.fregs[2] = 0x4002000000000000ull;   /* 2.25 */
+    h->rf.fregs[3] = 0x4014000000000000ull;   /* 5.0 */
+    h->rf.fregs[4] = 0x4000000000000000ull;   /* 2.0 */
+    h->rf.fregs[5] = 0x4022000000000000ull;   /* 9.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x01, 2, 1, 0, 10)); /* fadd.d */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x05, 2, 3, 0, 11)); /* fsub.d */
@@ -1142,24 +1159,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fp(0x2D, 0, 5, 0, 14)); /* fsqrt.d */
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[10] == 0x400E000000000000ull, "fadd.d 1.5+2.25 = 3.75");
-    CHECK(emu.rf.fregs[11] == 0x4006000000000000ull, "fsub.d 5.0-2.25 = 2.75");
-    CHECK(emu.rf.fregs[12] == 0x400B000000000000ull, "fmul.d 1.5*2.25 = 3.375");
-    CHECK(emu.rf.fregs[13] == 0x4004000000000000ull, "fdiv.d 5.0/2.0 = 2.5");
-    CHECK(emu.rf.fregs[14] == 0x4008000000000000ull, "fsqrt.d 9.0 = 3.0");
+    CHECK(h->rf.fregs[10] == 0x400E000000000000ull, "fadd.d 1.5+2.25 = 3.75");
+    CHECK(h->rf.fregs[11] == 0x4006000000000000ull, "fsub.d 5.0-2.25 = 2.75");
+    CHECK(h->rf.fregs[12] == 0x400B000000000000ull, "fmul.d 1.5*2.25 = 3.375");
+    CHECK(h->rf.fregs[13] == 0x4004000000000000ull, "fdiv.d 5.0/2.0 = 2.5");
+    CHECK(h->rf.fregs[14] == 0x4008000000000000ull, "fsqrt.d 9.0 = 3.0");
     emu_free(&emu);
 
     /* ---------------- RV32D: 符号 / min / max / 比较 ---------------- */
     printf("── RV32D sign / min / max / compare ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = 0x3FF0000000000000ull;   /* +1.0 */
-    emu.rf.fregs[2] = 0x8000000000000000ull;   /* -0.0 */
-    emu.rf.fregs[3] = 0x0000000000000000ull;   /* +0.0 */
+    h->rf.fregs[1] = 0x3FF0000000000000ull;   /* +1.0 */
+    h->rf.fregs[2] = 0x8000000000000000ull;   /* -0.0 */
+    h->rf.fregs[3] = 0x0000000000000000ull;   /* +0.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x11, 2, 1, 0, 10)); /* fsgnj.d */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x15, 3, 2, 0, 11)); /* fmin.d */
@@ -1169,24 +1186,24 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 20, enc_fp(0x51, 3, 2, 2, 7));  /* feq.d x7 */
     mem_write_inst(&emu.mem, base + 24, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 7);
 
-    CHECK(emu.rf.fregs[10] == 0xBFF0000000000000ull, "fsgnj.d +1.0 <- -0.0 = -1.0");
-    CHECK(emu.rf.fregs[11] == 0x8000000000000000ull, "fmin.d(-0.0, +0.0) = -0.0");
-    CHECK(emu.rf.fregs[12] == 0x0000000000000000ull, "fmax.d(-0.0, +0.0) = +0.0");
-    CHECK(reg_read(&emu.rf, 5) == 0, "flt.d 1.0 < -0.0 = 0");
-    CHECK(reg_read(&emu.rf, 6) == 1, "fle.d -0.0 <= +0.0 = 1");
-    CHECK(reg_read(&emu.rf, 7) == 1, "feq.d -0.0 == +0.0 = 1");
+    CHECK(h->rf.fregs[10] == 0xBFF0000000000000ull, "fsgnj.d +1.0 <- -0.0 = -1.0");
+    CHECK(h->rf.fregs[11] == 0x8000000000000000ull, "fmin.d(-0.0, +0.0) = -0.0");
+    CHECK(h->rf.fregs[12] == 0x0000000000000000ull, "fmax.d(-0.0, +0.0) = +0.0");
+    CHECK(reg_read(&h->rf, 5) == 0, "flt.d 1.0 < -0.0 = 0");
+    CHECK(reg_read(&h->rf, 6) == 1, "fle.d -0.0 <= +0.0 = 1");
+    CHECK(reg_read(&h->rf, 7) == 1, "feq.d -0.0 == +0.0 = 1");
     emu_free(&emu);
 
     /* ---------------- RV32D: 转换 ---------------- */
     printf("── RV32D fcvt ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = 0x400E000000000000ull;   /* 3.75 */
-    emu.rf.fregs[2] = 0xC004000000000000ull;   /* -2.5 */
+    h->rf.fregs[1] = 0x400E000000000000ull;   /* 3.75 */
+    h->rf.fregs[2] = 0xC004000000000000ull;   /* -2.5 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x61, 0, 1, 0, 10)); /* fcvt.w.d RNE */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x61, 0, 1, 1, 11)); /* fcvt.w.d RTZ */
@@ -1197,81 +1214,81 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 24, enc_fp(0x20, 1, 1, 0, 15)); /* fcvt.s.d f15 */
     mem_write_inst(&emu.mem, base + 28, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 8);
 
-    CHECK(reg_read(&emu.rf, 10) == 4, "fcvt.w.d 3.75 RNE = 4");
-    CHECK(reg_read(&emu.rf, 11) == 3, "fcvt.w.d 3.75 RTZ = 3");
-    CHECK((s32)reg_read(&emu.rf, 12) == -2, "fcvt.w.d -2.5 RNE = -2");
-    CHECK((s32)reg_read(&emu.rf, 13) == -3, "fcvt.w.d -2.5 RDN = -3");
-    CHECK(emu.rf.fregs[14] == 0x401C000000000000ull, "fcvt.d.w 7 = 7.0");
-    CHECK(emu.rf.fregs[15] == sf32(0x40700000u), "fcvt.s.d 3.75 -> boxed 3.75f");
+    CHECK(reg_read(&h->rf, 10) == 4, "fcvt.w.d 3.75 RNE = 4");
+    CHECK(reg_read(&h->rf, 11) == 3, "fcvt.w.d 3.75 RTZ = 3");
+    CHECK((s32)reg_read(&h->rf, 12) == -2, "fcvt.w.d -2.5 RNE = -2");
+    CHECK((s32)reg_read(&h->rf, 13) == -3, "fcvt.w.d -2.5 RDN = -3");
+    CHECK(h->rf.fregs[14] == 0x401C000000000000ull, "fcvt.d.w 7 = 7.0");
+    CHECK(h->rf.fregs[15] == sf32(0x40700000u), "fcvt.s.d 3.75 -> boxed 3.75f");
     emu_free(&emu);
 
     /* ---------------- RV32D: FCVT.D.S / FCLASS.D ---------------- */
     printf("── RV32D widen / fclass ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3FC00000u);       /* 1.5f */
-    emu.rf.fregs[2] = 0x7FF0000000000000ull;   /* +inf (double) */
-    emu.rf.fregs[3] = 0x7FF8000000000000ull;   /* qNaN (double) */
+    h->rf.fregs[1] = sf32(0x3FC00000u);       /* 1.5f */
+    h->rf.fregs[2] = 0x7FF0000000000000ull;   /* +inf (double) */
+    h->rf.fregs[3] = 0x7FF8000000000000ull;   /* qNaN (double) */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x21, 0, 1, 0, 10)); /* fcvt.d.s */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x71, 0, 2, 1, 11)); /* fclass.d +inf */
     mem_write_inst(&emu.mem, base + 8,  enc_fp(0x71, 0, 3, 1, 12)); /* fclass.d qNaN */
     mem_write_inst(&emu.mem, base + 12, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 4);
 
-    CHECK(emu.rf.fregs[10] == 0x3FF8000000000000ull, "fcvt.d.s 1.5f = 1.5");
-    CHECK(reg_read(&emu.rf, 11) == (1u << 7), "fclass.d(+inf) = bit 7");
-    CHECK(reg_read(&emu.rf, 12) == (1u << 9), "fclass.d(qNaN) = bit 9");
+    CHECK(h->rf.fregs[10] == 0x3FF8000000000000ull, "fcvt.d.s 1.5f = 1.5");
+    CHECK(reg_read(&h->rf, 11) == (1u << 7), "fclass.d(+inf) = bit 7");
+    CHECK(reg_read(&h->rf, 12) == (1u << 9), "fclass.d(qNaN) = bit 9");
     emu_free(&emu);
 
     /* ---------------- NaN boxing ---------------- */
     printf("── NaN boxing ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = 0x3F800000u;             /* 未 box 的 1.0f */
-    emu.rf.fregs[2] = sf32(0x3F800000u);       /* 正确 box 的 1.0f */
+    h->rf.fregs[1] = 0x3F800000u;             /* 未 box 的 1.0f */
+    h->rf.fregs[2] = sf32(0x3F800000u);       /* 正确 box 的 1.0f */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x00, 2, 1, 0, 10)); /* fadd.s */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x00, 2, 2, 0, 11)); /* fadd.s */
     mem_write_inst(&emu.mem, base + 8,  0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 3);
 
-    CHECK(emu.rf.fregs[10] == sf32(0x7FC00000u),
+    CHECK(h->rf.fregs[10] == sf32(0x7FC00000u),
           "unboxed operand reads as canonical NaN");
-    CHECK(emu.rf.fregs[11] == sf32(0x40000000u),
+    CHECK(h->rf.fregs[11] == sf32(0x40000000u),
           "boxed operands add normally");
     emu_free(&emu);
 
     /* ---------------- fflags ---------------- */
     printf("── fflags ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3F800000u);   /* 1.0 */
-    emu.rf.fregs[2] = sf32(0x00000000u);   /* 0.0 */
-    emu.rf.fregs[3] = sf32(0x40400000u);   /* 3.0 */
+    h->rf.fregs[1] = sf32(0x3F800000u);   /* 1.0 */
+    h->rf.fregs[2] = sf32(0x00000000u);   /* 0.0 */
+    h->rf.fregs[3] = sf32(0x40400000u);   /* 3.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fp(0x0C, 2, 1, 0, 10)); /* fdiv 1/0 */
     mem_write_inst(&emu.mem, base + 4,  enc_fp(0x0C, 2, 2, 0, 11)); /* fdiv 0/0 */
     mem_write_inst(&emu.mem, base + 8,  enc_fp(0x0C, 3, 1, 0, 12)); /* fdiv 1/3 */
     mem_write_inst(&emu.mem, base + 12, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 4);
 
-    CHECK((emu.csr.fflags & FP_DZ) != 0, "1.0/0.0 sets DZ");
-    CHECK((emu.csr.fflags & FP_NV) != 0, "0.0/0.0 sets NV");
-    CHECK((emu.csr.fflags & FP_NX) != 0, "1.0/3.0 sets NX");
-    CHECK((emu.csr.fflags & FP_OF) == 0, "no OF");
+    CHECK((h->csr.fflags & FP_DZ) != 0, "1.0/0.0 sets DZ");
+    CHECK((h->csr.fflags & FP_NV) != 0, "0.0/0.0 sets NV");
+    CHECK((h->csr.fflags & FP_NX) != 0, "1.0/3.0 sets NX");
+    CHECK((h->csr.fflags & FP_OF) == 0, "no OF");
     emu_free(&emu);
 
     /* ---------------- fcsr CSR ---------------- */
@@ -1280,27 +1297,27 @@ void fpu_selftest(void)
     {
         bool ok = false;
 
-        csr_write(&emu.csr, CSR_FCSR, 0x63u, &ok);
-        bits = csr_read(&emu.csr, CSR_FCSR, &ok);
+        csr_write(&h->csr, CSR_FCSR, 0x63u, &ok);
+        bits = csr_read(&h->csr, CSR_FCSR, &ok);
         CHECK(ok && bits == 0x63u, "fcsr write/read 0x63");
-        CHECK(emu.csr.frm == 3u && emu.csr.fflags == 3u,
+        CHECK(h->csr.frm == 3u && h->csr.fflags == 3u,
               "fcsr split into frm=3 fflags=3");
-        csr_write(&emu.csr, CSR_FRM, 0x7u, &ok);
-        CHECK(csr_read(&emu.csr, CSR_FRM, &ok) == 7u, "frm accepts dynamic mode");
+        csr_write(&h->csr, CSR_FRM, 0x7u, &ok);
+        CHECK(csr_read(&h->csr, CSR_FRM, &ok) == 7u, "frm accepts dynamic mode");
     }
     emu_free(&emu);
 
     /* ---------------- 融合乘加 S (v0.10) ---------------- */
     printf("── FMA.S (fmadd/fmsub/fnmsub/fnmadd) ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = sf32(0x3FC00000u);   /* 1.5 */
-    emu.rf.fregs[2] = sf32(0x40100000u);   /* 2.25 */
-    emu.rf.fregs[3] = sf32(0x3F000000u);   /* 0.5 */
-    emu.rf.fregs[4] = sf32(0x3F800001u);   /* 1 + 2^-23 */
-    emu.rf.fregs[5] = sf32(0x3F7FFFFFu);   /* 1 - 2^-24 */
-    emu.rf.fregs[6] = sf32(0xBF800000u);   /* -1.0 */
+    h->rf.fregs[1] = sf32(0x3FC00000u);   /* 1.5 */
+    h->rf.fregs[2] = sf32(0x40100000u);   /* 2.25 */
+    h->rf.fregs[3] = sf32(0x3F000000u);   /* 0.5 */
+    h->rf.fregs[4] = sf32(0x3F800001u);   /* 1 + 2^-23 */
+    h->rf.fregs[5] = sf32(0x3F7FFFFFu);   /* 1 - 2^-24 */
+    h->rf.fregs[6] = sf32(0xBF800000u);   /* -1.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fma(OP_FMADD,  0, 3, 2, 1, 0, 10));
     mem_write_inst(&emu.mem, base + 4,  enc_fma(OP_FMSUB,  0, 3, 2, 1, 0, 11));
@@ -1314,28 +1331,28 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fma(OP_FMADD,  0, 6, 5, 4, 0, 14));
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[10] == sf32(0x40780000u), "fmadd.s 1.5*2.25+0.5 = 3.875");
-    CHECK(emu.rf.fregs[11] == sf32(0x40380000u), "fmsub.s 1.5*2.25-0.5 = 2.875");
-    CHECK(emu.rf.fregs[12] == sf32(0xC0380000u), "fnmsub.s -(1.5*2.25)+0.5 = -2.875");
-    CHECK(emu.rf.fregs[13] == sf32(0xC0780000u), "fnmadd.s -(1.5*2.25)-0.5 = -3.875");
-    CHECK(emu.rf.fregs[14] == sf32(0x337FFFFEu),
+    CHECK(h->rf.fregs[10] == sf32(0x40780000u), "fmadd.s 1.5*2.25+0.5 = 3.875");
+    CHECK(h->rf.fregs[11] == sf32(0x40380000u), "fmsub.s 1.5*2.25-0.5 = 2.875");
+    CHECK(h->rf.fregs[12] == sf32(0xC0380000u), "fnmsub.s -(1.5*2.25)+0.5 = -2.875");
+    CHECK(h->rf.fregs[13] == sf32(0xC0780000u), "fnmadd.s -(1.5*2.25)-0.5 = -3.875");
+    CHECK(h->rf.fregs[14] == sf32(0x337FFFFEu),
           "fmadd.s (1+e)*(1-e/2)-1 = 2^-24-2^-47 (fused)");
     emu_free(&emu);
 
     /* ---------------- 融合乘加 D (v0.10) ---------------- */
     printf("── FMA.D ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.state = EMU_RUNNING;
+    h->state = EMU_RUNNING;
 
-    emu.rf.fregs[1] = 0x3FF8000000000000ull;   /* 1.5 */
-    emu.rf.fregs[2] = 0x4002000000000000ull;   /* 2.25 */
-    emu.rf.fregs[3] = 0x4014000000000000ull;   /* 5.0 */
-    emu.rf.fregs[4] = 0x3FF0000000000001ull;   /* 1 + 2^-52 */
-    emu.rf.fregs[5] = 0x3FEFFFFFFFFFFFFFull;   /* 1 - 2^-53 */
-    emu.rf.fregs[6] = 0xBFF0000000000000ull;   /* -1.0 */
+    h->rf.fregs[1] = 0x3FF8000000000000ull;   /* 1.5 */
+    h->rf.fregs[2] = 0x4002000000000000ull;   /* 2.25 */
+    h->rf.fregs[3] = 0x4014000000000000ull;   /* 5.0 */
+    h->rf.fregs[4] = 0x3FF0000000000001ull;   /* 1 + 2^-52 */
+    h->rf.fregs[5] = 0x3FEFFFFFFFFFFFFFull;   /* 1 - 2^-53 */
+    h->rf.fregs[6] = 0xBFF0000000000000ull;   /* -1.0 */
 
     mem_write_inst(&emu.mem, base + 0,  enc_fma(OP_FMADD,  1, 3, 2, 1, 0, 20));
     mem_write_inst(&emu.mem, base + 4,  enc_fma(OP_FMSUB,  1, 3, 2, 1, 0, 21));
@@ -1345,14 +1362,14 @@ void fpu_selftest(void)
     mem_write_inst(&emu.mem, base + 16, enc_fma(OP_FMADD,  1, 6, 5, 4, 0, 24));
     mem_write_inst(&emu.mem, base + 20, 0x00000073);
 
-    emu.rf.pc = base;
+    h->rf.pc = base;
     emu_run(&emu, 6);
 
-    CHECK(emu.rf.fregs[20] == 0x4020C00000000000ull, "fmadd.d 1.5*2.25+5.0 = 8.375");
-    CHECK(emu.rf.fregs[21] == 0xBFFA000000000000ull, "fmsub.d 1.5*2.25-5.0 = -1.625");
-    CHECK(emu.rf.fregs[22] == 0x3FFA000000000000ull, "fnmsub.d -(1.5*2.25)+5.0 = 1.625");
-    CHECK(emu.rf.fregs[23] == 0xC020C00000000000ull, "fnmadd.d -(1.5*2.25)-5.0 = -8.375");
-    CHECK(emu.rf.fregs[24] == 0x3C9FFFFFFFFFFFFEull,
+    CHECK(h->rf.fregs[20] == 0x4020C00000000000ull, "fmadd.d 1.5*2.25+5.0 = 8.375");
+    CHECK(h->rf.fregs[21] == 0xBFFA000000000000ull, "fmsub.d 1.5*2.25-5.0 = -1.625");
+    CHECK(h->rf.fregs[22] == 0x3FFA000000000000ull, "fnmsub.d -(1.5*2.25)+5.0 = 1.625");
+    CHECK(h->rf.fregs[23] == 0xC020C00000000000ull, "fnmadd.d -(1.5*2.25)-5.0 = -8.375");
+    CHECK(h->rf.fregs[24] == 0x3C9FFFFFFFFFFFFEull,
           "fmadd.d (1+e)*(1-e/2)-1 = 2^-53-2^-105 (fused)");
     emu_free(&emu);
 

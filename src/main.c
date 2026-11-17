@@ -6,6 +6,7 @@
  *   rvemu <riscv-elf>            直接运行到 ecall/ebreak
  *   rvemu -d <riscv-elf>         进入交互式调试器
  *   rvemu --steps N <riscv-elf>  最多执行 N 条指令
+ *   rvemu --harts N <riscv-elf>  模拟 N 个 hart (默认 1)
  *   rvemu --selftest             解码 / 执行 / trap / Sv32 / FPU 自测
  */
 
@@ -27,6 +28,7 @@ static void usage(const char *prog)
     printf("\nOptions:\n");
     printf("  -d, --debug      interactive debugger\n");
     printf("  --steps N        stop after N instructions\n");
+    printf("  --harts N        emulate N harts (default 1, max %d)\n", MAX_HARTS);
     printf("  -h, --help       this message\n");
 }
 
@@ -37,6 +39,7 @@ int main(int argc, char *argv[])
     bool debug = false;
     bool selftest = false;
     u64 max_steps = 0;
+    u32 nharts = 1;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -46,6 +49,12 @@ int main(int argc, char *argv[])
             debug = true;
         } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
             max_steps = (u64)strtoul(argv[++i], NULL, 0);
+        } else if (strcmp(argv[i], "--harts") == 0 && i + 1 < argc) {
+            nharts = (u32)strtoul(argv[++i], NULL, 0);
+            if (nharts < 1 || nharts > MAX_HARTS) {
+                printf("bad hart count %u (1..%u)\n", nharts, MAX_HARTS);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -59,16 +68,18 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.11                │\n");
-    printf("│  RV32IMAFC + D + Sv32 + S/U-mode     │\n");
+    printf("│  RV32I Emulator v0.12                │\n");
+    printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, nharts);
 
     if (selftest) {
         decode_selftest();
         rvc_selftest();
         execute_selftest();
+        emu_selftest();
         trap_selftest();
         trap_smode_selftest();
         mmu_selftest();
@@ -90,7 +101,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     printf("  entry = 0x%08X\n", emu.entry);
-    printf("  pc    = 0x%08X\n", emu.rf.pc);
+    printf("  pc    = 0x%08X\n", emu.harts[0].rf.pc);
 
     if (debug) {
         debug_repl(&emu);

@@ -37,7 +37,8 @@ static int fault_cause(access_t acc)
  */
 static bool pte_allows(emulator_t *emu, u32 pte, access_t acc)
 {
-    u32 priv = emu->priv;
+    hart_t *h = emu_hart(emu);
+    u32 priv = h->priv;
 
     /* 叶子项至少要有 R 或 X; W=1 而 R=0 是保留编码 */
     if ((pte & (PTE_R | PTE_X)) == 0) return false;
@@ -53,7 +54,7 @@ static bool pte_allows(emulator_t *emu, u32 pte, access_t acc)
      */
     if (priv == PRIV_S && (pte & PTE_U)) {
         if (acc == ACC_FETCH) return false;
-        if (!(emu->csr.mstatus & MSTATUS_SUM)) return false;
+        if (!(h->csr.mstatus & MSTATUS_SUM)) return false;
     }
 
     switch (acc) {
@@ -84,7 +85,8 @@ static void pte_update_ad(emulator_t *emu, u32 pte_addr, u32 pte, access_t acc)
 
 int mmu_translate(emulator_t *emu, u32 va, access_t acc, u32 *pa)
 {
-    const csr_t *csr = &emu->csr;
+    hart_t *h = emu_hart(emu);
+    const csr_t *csr = &h->csr;
     u32 satp = csr->satp;
     u32 vpn1, vpn0;
     u32 pte_addr, pte;
@@ -97,7 +99,7 @@ int mmu_translate(emulator_t *emu, u32 va, access_t acc, u32 *pa)
      * 没有实现 S 态和 MPRV, 所以 M 态一律直通 —— 内核代码在 M 态
      * 里操作页表, 用的必须是物理地址, 这一点和真机一致。
      */
-    if (emu->priv == PRIV_M || (satp & SATP_MODE_BIT) == 0) {
+    if (h->priv == PRIV_M || (satp & SATP_MODE_BIT) == 0) {
         *pa = va;
         return 0;
     }
@@ -236,16 +238,18 @@ static u32 enc_csrrs(u32 rd, u32 csr)
 /* 准备一个 U 态模拟器: 页表建好, satp 打开 */
 static void setup_user_emu(emulator_t *emu)
 {
+    hart_t *h = emu_hart(emu);
     emu_init(emu, MEM_SIZE);
-    emu->state = EMU_RUNNING;
-    emu->priv  = PRIV_U;
+    h->state = EMU_RUNNING;
+    h->priv  = PRIV_U;
     build_test_tables(emu);
-    emu->csr.satp = SATP_MODE_BIT | (T_ROOT >> 12);
+    h->csr.satp = SATP_MODE_BIT | (T_ROOT >> 12);
 }
 
 void mmu_selftest(void)
 {
     emulator_t emu;
+    hart_t *h = &emu.harts[0];
     u32 pa;
 
     printf("\n");
@@ -257,8 +261,8 @@ void mmu_selftest(void)
     /* ---------- 1. M 态直通 ---------- */
     printf("── M-mode bypasses translation ──\n");
     emu_init(&emu, MEM_SIZE);
-    emu.priv = PRIV_M;
-    emu.csr.satp = SATP_MODE_BIT | (T_ROOT >> 12);
+    h->priv = PRIV_M;
+    h->csr.satp = SATP_MODE_BIT | (T_ROOT >> 12);
     MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == 0 &&
               pa == VA_DATA, "M-mode: satp ignored, VA == PA");
     MMU_CHECK(mmu_translate(&emu, VA_NOMAP, ACC_STORE, &pa) == 0,
@@ -266,8 +270,8 @@ void mmu_selftest(void)
 
     /* ---------- 2. bare 模式 ---------- */
     printf("\n── bare mode (satp.MODE = 0) ──\n");
-    emu.priv = PRIV_U;
-    emu.csr.satp = 0;
+    h->priv = PRIV_U;
+    h->csr.satp = 0;
     MMU_CHECK(mmu_translate(&emu, 0x12345000u, ACC_LOAD, &pa) == 0 &&
               pa == 0x12345000u, "U-mode bare: VA == PA");
 
@@ -319,14 +323,14 @@ void mmu_selftest(void)
     /* ---------- 6.5 S 态与 SUM (v0.5) ---------- */
     printf("\n── S-mode access to U pages ──\n");
     {
-        emu.priv = PRIV_S;
-        emu.csr.mstatus &= ~MSTATUS_SUM;
+        h->priv = PRIV_S;
+        h->csr.mstatus &= ~MSTATUS_SUM;
         MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == EXC_LOAD_PAGE_FAULT,
                   "S load of U page without SUM → fault");
         MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_STORE, &pa) == EXC_STORE_PAGE_FAULT,
                   "S store of U page without SUM → fault");
 
-        emu.csr.mstatus |= MSTATUS_SUM;
+        h->csr.mstatus |= MSTATUS_SUM;
         MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_LOAD, &pa) == 0 &&
                   pa == T_DATA, "SUM=1: S load of U page allowed");
         MMU_CHECK(mmu_translate(&emu, VA_DATA, ACC_STORE, &pa) == 0,
@@ -339,13 +343,13 @@ void mmu_selftest(void)
             u32 pte;
             memory_read32(&emu.mem, T_L2 + 0x10 * 4u, &pte);
             memory_write32(&emu.mem, T_L2 + 0x10 * 4u, pte & ~PTE_U);
-            emu.csr.mstatus &= ~MSTATUS_SUM;
+            h->csr.mstatus &= ~MSTATUS_SUM;
             MMU_CHECK(mmu_translate(&emu, VA_CODE, ACC_FETCH, &pa) == 0,
                       "S fetches S page without SUM");
             memory_write32(&emu.mem, T_L2 + 0x10 * 4u, pte);
         }
 
-        emu.priv = PRIV_U;          /* 后面的用例恢复 U 态前提 */
+        h->priv = PRIV_U;          /* 后面的用例恢复 U 态前提 */
     }
 
     /* ---------- 7. 未映射地址 ---------- */
@@ -377,28 +381,29 @@ void mmu_selftest(void)
     printf("\n── privilege transitions ──\n");
     {
         emulator_t e2;
+        hart_t *h2 = &e2.harts[0];
         decoded_inst_t inst;
 
         emu_init(&e2, MEM_SIZE);
-        e2.state = EMU_RUNNING;
-        e2.csr.mtvec = 0x300;
-        e2.priv = PRIV_U;
+        h2->state = EMU_RUNNING;
+        h2->csr.mtvec = 0x300;
+        h2->priv = PRIV_U;
         /* 0x40: ecall */
         memory_write32(&e2.mem, 0x40, 0x00000073);
-        e2.rf.pc = 0x40;
+        h2->rf.pc = 0x40;
         emu_step(&e2, &inst);
-        MMU_CHECK(e2.csr.mcause == EXC_ECALL_U, "ecall from U → cause 8");
-        MMU_CHECK(((e2.csr.mstatus & MSTATUS_MPP_MASK) >> 11) == PRIV_U,
+        MMU_CHECK(h2->csr.mcause == EXC_ECALL_U, "ecall from U → cause 8");
+        MMU_CHECK(((h2->csr.mstatus & MSTATUS_MPP_MASK) >> 11) == PRIV_U,
                   "MPP records U-mode");
-        MMU_CHECK(e2.priv == PRIV_M, "trap enters M-mode");
+        MMU_CHECK(h2->priv == PRIV_M, "trap enters M-mode");
 
         /* handler 里 mret, MPP 还是 U → 回到 U 态 */
         memory_write32(&e2.mem, 0x300, 0x30200073);   /* mret */
-        e2.rf.pc = 0x300;
+        h2->rf.pc = 0x300;
         emu_step(&e2, &inst);
-        MMU_CHECK(e2.priv == PRIV_U, "mret returns to U-mode");
-        MMU_CHECK(e2.rf.pc == 0x40, "pc = mepc");
-        MMU_CHECK(((e2.csr.mstatus & MSTATUS_MPP_MASK) >> 11) == PRIV_U,
+        MMU_CHECK(h2->priv == PRIV_U, "mret returns to U-mode");
+        MMU_CHECK(h2->rf.pc == 0x40, "pc = mepc");
+        MMU_CHECK(((h2->csr.mstatus & MSTATUS_MPP_MASK) >> 11) == PRIV_U,
                   "MPP reset to U (least privileged supported)");
     }
 
@@ -406,29 +411,30 @@ void mmu_selftest(void)
     printf("\n── privileged instructions in U-mode ──\n");
     {
         emulator_t e2;
+        hart_t *h2 = &e2.harts[0];
         decoded_inst_t inst;
 
         emu_init(&e2, MEM_SIZE);
-        e2.state = EMU_RUNNING;
-        e2.csr.mtvec = 0x300;
-        e2.priv = PRIV_U;
+        h2->state = EMU_RUNNING;
+        h2->csr.mtvec = 0x300;
+        h2->priv = PRIV_U;
         /* 0x40: csrr t0, mstatus (0x300)  → csrrs x5, 0x300, x0 */
         memory_write32(&e2.mem, 0x40, enc_csrrs(5, CSR_MSTATUS));
-        e2.rf.pc = 0x40;
+        h2->rf.pc = 0x40;
         emu_step(&e2, &inst);
-        MMU_CHECK(e2.csr.mcause == EXC_ILLEGAL_INST,
+        MMU_CHECK(h2->csr.mcause == EXC_ILLEGAL_INST,
                   "CSR access from U → illegal instruction");
-        MMU_CHECK(e2.rf.pc == 0x300, "pc = mtvec");
+        MMU_CHECK(h2->rf.pc == 0x300, "pc = mtvec");
 
         /* 0x50: mret —— U 态执行也是非法指令 */
         emu_init(&e2, MEM_SIZE);
-        e2.state = EMU_RUNNING;
-        e2.csr.mtvec = 0x300;
-        e2.priv = PRIV_U;
+        h2->state = EMU_RUNNING;
+        h2->csr.mtvec = 0x300;
+        h2->priv = PRIV_U;
         memory_write32(&e2.mem, 0x50, 0x30200073);
-        e2.rf.pc = 0x50;
+        h2->rf.pc = 0x50;
         emu_step(&e2, &inst);
-        MMU_CHECK(e2.csr.mcause == EXC_ILLEGAL_INST, "mret from U → illegal");
+        MMU_CHECK(h2->csr.mcause == EXC_ILLEGAL_INST, "mret from U → illegal");
     }
 
     printf("\n  Result: %d passed, %d failed\n", mmu_pass, mmu_fail);

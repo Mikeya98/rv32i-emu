@@ -39,6 +39,7 @@ u32 csr_read(csr_t *csr, u32 addr, bool *ok)
     case CSR_MCAUSE:   return csr->mcause;
     case CSR_MTVAL:    return csr->mtval;
     case CSR_MIP:      return csr->mip;
+    case CSR_MHARTID:  return csr->mhartid;     /* 只读 */
     case CSR_MCYCLE:   return (u32)(csr->mcycle & 0xFFFFFFFF);
     default:
         if (ok) *ok = false;
@@ -132,6 +133,7 @@ void csr_dump(csr_t *csr)
     printf("  mtval    = 0x%08X\n", csr->mtval);
     printf("  mie/mip  = 0x%08X / 0x%08X\n", csr->mie, csr->mip);
     printf("  mcycle   = %llu\n",   (unsigned long long)csr->mcycle);
+    printf("  mhartid  = %u\n",     csr->mhartid);
     printf("  S-mode: sstatus=0x%08X (SIE=%u SPIE=%u SPP=%u SUM=%u FS=%u)\n",
            csr->mstatus & SSTATUS_MASK,
            (csr->mstatus & MSTATUS_SIE) ? 1u : 0u,
