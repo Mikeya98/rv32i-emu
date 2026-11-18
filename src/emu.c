@@ -457,6 +457,7 @@ void emu_selftest(void)
 
     /* ---------- 7. 轮转调度 + 原子计数 ---------- */
     printf("\n── round-robin: two harts count to 10 ──\n");
+    emu_free(&emu);                 /* 换一台新机器, 先释放上一块内存 */
     emu_init(&emu, MEM_SIZE);
     emu_init_harts(&emu, 2);
     h0 = &emu.harts[0];
