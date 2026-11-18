@@ -231,6 +231,18 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             goto except;
         }
 
+        /*
+         * v0.13 CLINT msip: 每个 hart 一个 32 位寄存器, bit0 = 软件中断
+         * pending。读它就是读电平, 清零要靠写 0。
+         */
+        if (inst->funct3 == F3_LW &&
+            pa >= CLINT_MSIP_BASE && pa < CLINT_MSIP_END) {
+            u32 who = (pa - CLINT_MSIP_BASE) / 4u;
+            reg_write(&h->rf, inst->rd,
+                      (who < emu->nharts) ? emu->harts[who].msip : 0u);
+            break;
+        }
+
         /* 简化版 CLINT: mtime 全机器共享, 低/高 32 位分开读 */
         if (inst->funct3 == F3_LW && pa == CLINT_MTIME_LO) {
             reg_write(&h->rf, inst->rd, (u32)(emu->mtime & 0xFFFFFFFFu));
@@ -334,6 +346,26 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         if (xrc != 0) {
             fault_cause = xrc;
             goto except;
+        }
+
+        /*
+         * v0.13 CLINT msip: 写 1 = 给目标核发软件中断, 写 0 = 撤销。
+         * 目标核可以是自己, 也可以是别的核 —— 这就是 IPI 的底层机制。
+         * 同时更新目标核的 mip.MSIP, 软件紧接着读 mip 能看到一致的值。
+         */
+        if (inst->funct3 == F3_SW &&
+            pa >= CLINT_MSIP_BASE && pa < CLINT_MSIP_END) {
+            u32 who = (pa - CLINT_MSIP_BASE) / 4u;
+            if (who < emu->nharts) {
+                hart_t *o = &emu->harts[who];
+                o->msip = rs2_val & 1u;
+                if (o->msip) {
+                    o->csr.mip |= MIP_MSIP;
+                } else {
+                    o->csr.mip &= ~MIP_MSIP;
+                }
+            }
+            break;
         }
 
         /*

@@ -55,10 +55,16 @@
 
 /*
  * CLINT 简化版: 地址与真实 CLINT 一致。
+ *   msip     每个 hart 一个 32 位寄存器, 只有 bit0 有意义:
+ *            hart0 在 0x02000000, hart1 在 0x02000004 … (v0.13)
+ *            写 1 拉起该核的软件中断, 写 0 拉低。电平信号, 不清就一直挂。
  *   mtimecmp 每个 hart 占 8 字节: hart0 在 0x02004000, hart1 在 0x02004008 …
  *   mtime 全机器共享一个 64 位计数器, 低 32 位在 0x0200BFF8。
  * 只实现低 32 位比较 (高 32 位写入被忽略)。
  */
+#define CLINT_MSIP_BASE     0x02000000u
+#define CLINT_MSIP(h)       (CLINT_MSIP_BASE + 4u * (h))
+#define CLINT_MSIP_END      (CLINT_MSIP_BASE + 4u * 4u)   /* 最多 MAX_HARTS 个 */
 #define CLINT_MTIMECMP_BASE 0x02004000u
 #define CLINT_MTIMECMP_LO(h) (CLINT_MTIMECMP_BASE + 8u * (h))
 #define CLINT_MTIME_LO      0x0200BFF8u
@@ -103,11 +109,14 @@
 #define PRIV_M             3u
 
 /* mie / mip 位 */
+#define MIE_MSIE           (1u << 3)    /* 机器软件中断使能 (v0.13) */
+#define MIP_MSIP           (1u << 3)    /* 机器软件中断 pending */
 #define MIE_MTIE           (1u << 7)    /* 机器定时器中断使能 */
 #define MIP_MTIP           (1u << 7)    /* 机器定时器中断 pending */
 
 /* mcause: 最高位 = 1 表示中断, 否则是异常 */
 #define MCAUSE_IRQ_BIT     0x80000000u
+#define MCAUSE_IRQ_SOFT    (MCAUSE_IRQ_BIT | 3)   /* 3 = machine software (v0.13) */
 #define MCAUSE_IRQ_TIMER   (MCAUSE_IRQ_BIT | 7)   /* 7 = machine timer */
 
 /* 异常码 (和 RISC-V 规范一致) */

@@ -4,6 +4,7 @@
  *
  * v0.12 起支持多 hart: 一台机器 (emulator_t) 里有 N 个核 (hart_t),
  * 它们共享同一块物理内存, 但各自有寄存器、CSR、特权级和 LR/SC 保留集。
+ * v0.13 补上 CLINT msip: 核间可以互相发软件中断 (IPI)。
  */
 
 #ifndef _RVEMU_EMU_H
@@ -47,6 +48,13 @@ typedef struct {
 
     /* 本 hart 的定时器比较值; 0 表示关闭 */
     u64         mtimecmp;
+
+    /*
+     * v0.13: CLINT 的 msip[hartid]。别的核往这个地址写 1, 本核就挂上
+     * 软件中断 (mip.MSIP); 写 0 才撤掉。电平语义, 和 mtimecmp 一样
+     * 由发中断的一方负责清除。
+     */
+    u32         msip;
 
     emu_state_t state;
 } hart_t;

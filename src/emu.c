@@ -34,6 +34,7 @@ static void hart_reset(hart_t *h, u32 hartid)
     h->reservation_valid = 0;
     h->reservation_addr  = 0;
     h->mtimecmp          = 0;               /* 0 = 定时器关闭 */
+    h->msip              = 0;               /* v0.13: 复位时没有软件中断 */
     h->state             = EMU_HALTED;
 }
 
@@ -482,6 +483,101 @@ void emu_selftest(void)
         MH_CHECK(h0->state == EMU_HALTED && h1->state == EMU_HALTED,
                  "both harts halted");
     }
+
+    /* ---------- 8. CLINT msip / 软件中断 (v0.13) ---------- */
+    printf("\n── CLINT msip / software interrupt ──\n");
+    emu_free(&emu);
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h0 = &emu.harts[0];
+    h1 = &emu.harts[1];
+
+    /*
+     * hart0 写 0x02000004 —— 这是 hart1 的 msip, 相当于给它发一个 IPI。
+     * lui x1, 0x02000; sw x2, 0(x1+4) 用 addi 调整地址。
+     */
+    put32(&emu, 0x100, 0x020000B7u);                 /* lui  x1, 0x02000   */
+    put32(&emu, 0x104, enc_i(4, 1, 0, 1, 0x13));     /* addi x1, x1, 4     */
+    put32(&emu, 0x108, enc_s(0, 2, 1, 2));           /* sw   x2, 0(x1)     */
+    h0->rf.regs[2] = 1;
+    h0->rf.pc = 0x100;
+    h0->state = EMU_RUNNING;
+    emu.cur = 0;
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->msip == 1, "hart0 writes hart1 msip → pending");
+    MH_CHECK((h1->csr.mip & MIP_MSIP) != 0, "hart1 mip.MSIP set by the write");
+
+    /* hart1 从自己的 msip 地址读回 1 */
+    put32(&emu, 0x110, enc_i(0, 1, 2, 3, 0x03));     /* lw x3, 0(x1)       */
+    h1->rf.regs[1] = 0x02000004u;
+    h1->rf.pc = 0x110;
+    h1->state = EMU_RUNNING;
+    emu.cur = 1;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.regs[3] == 1, "reading msip returns the level");
+
+    /* MIE=0 时只是 pending, 不陷入 */
+    put32(&emu, 0x120, 0x00000013u);                 /* nop (addi x0,x0,0) */
+    h1->csr.mtvec = 0x800;
+    h1->csr.mie = MIE_MSIE;
+    h1->csr.mstatus = 0;
+    h1->rf.pc = 0x120;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.pc == 0x124, "MIE=0 → interrupt stays pending");
+
+    /* MIE=1 → 在指令边界进入 handler */
+    h1->csr.mstatus = MSTATUS_MIE;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.pc == 0x800, "MIE=1 → pc = mtvec");
+    MH_CHECK(h1->csr.mcause == MCAUSE_IRQ_SOFT, "mcause = 0x80000003 (software)");
+    MH_CHECK(h1->csr.mepc == 0x124, "mepc = interrupted instruction");
+    MH_CHECK((h1->csr.mstatus & MSTATUS_MIE) == 0, "MIE cleared in handler");
+
+    /*
+     * handler 写 0 到自己的 msip: lui/addi 到 0x02000004 再 sw x0。
+     * 电平信号不清就会反复进中断, 所以这一步是必须的。
+     */
+    put32(&emu, 0x800, 0x020000B7u);                 /* lui  x1, 0x02000   */
+    put32(&emu, 0x804, enc_i(4, 1, 0, 1, 0x13));     /* addi x1, x1, 4     */
+    put32(&emu, 0x808, enc_s(0, 0, 1, 2));           /* sw   x0, 0(x1)     */
+    h1->rf.pc = 0x800;
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->msip == 0, "writing 0 clears msip");
+    MH_CHECK((h1->csr.mip & MIP_MSIP) == 0, "mip.MSIP drops with msip");
+
+    /* mret 回到被中断的指令, 没有新 pending 就不再进 handler */
+    put32(&emu, 0x80C, 0x30200073u);                 /* mret               */
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.pc == 0x124, "mret returns to mepc");
+
+    /* 电平语义: 不写 0 的话, 一 mret 就再进一次 */
+    h1->msip = 1;
+    h1->csr.mip |= MIP_MSIP;
+    h1->csr.mstatus = MSTATUS_MIE;
+    put32(&emu, 0x124, 0x00000013u);
+    h1->rf.pc = 0x124;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->rf.pc == 0x800, "uncleared msip retriggers immediately");
+
+    /* 优先级: 软件中断先于定时器中断 */
+    h1->csr.mstatus = MSTATUS_MIE;
+    h1->csr.mie = MIE_MSIE | MIE_MTIE;
+    h1->mtimecmp = 1;                    /* mtime 早已超过 → MTIP pending */
+    h1->rf.pc = 0x124;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->csr.mcause == MCAUSE_IRQ_SOFT,
+             "MSIP has priority over MTIP");
+    h1->msip = 0;
+    h1->csr.mip &= ~MIP_MSIP;
+    h1->csr.mstatus = MSTATUS_MIE;
+    h1->rf.pc = 0x124;
+    emu_step(&emu, &inst);
+    MH_CHECK(h1->csr.mcause == MCAUSE_IRQ_TIMER,
+             "timer fires after software IRQ is cleared");
 
     printf("\n  Result: %d passed, %d failed\n", pass, fail);
     emu_free(&emu);

@@ -106,13 +106,29 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
     }
 
     /*
+     * v0.13: 软件中断也是电平信号, 由 CLINT msip 寄存器拉起来。
+     * 这里每步同步一次 mip, 保证软件读到的 pending 位和 CLINT 一致。
+     */
+    if (h->msip) {
+        csr->mip |= MIP_MSIP;
+    } else {
+        csr->mip &= ~MIP_MSIP;
+    }
+
+    /*
      * M 态取中断看 mstatus.MIE; U 态可以直接被 M 态中断打断
      * (规范和真机都是这样 —— 低特权级挡不住高特权级的中断)。
+     *
+     * 优先级按规范: 机器外部 > 机器软件 > 机器定时器。本模拟器没有
+     * 外部中断, 所以只要同时 pending, 先报软件中断 (mcause = 3)。
      */
-    if ((csr->mip & MIP_MTIP) &&
-        (csr->mie & MIE_MTIE) &&
-        (h->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE))) {
-        return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
+    if (h->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE)) {
+        if ((csr->mip & MIP_MSIP) && (csr->mie & MIE_MSIE)) {
+            return trap_raise(emu, MCAUSE_IRQ_SOFT, 0, epc);
+        }
+        if ((csr->mip & MIP_MTIP) && (csr->mie & MIE_MTIE)) {
+            return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
+        }
     }
 
     return false;

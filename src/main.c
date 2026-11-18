@@ -68,8 +68,9 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.12                │\n");
+    printf("│  RV32I Emulator v0.13                │\n");
     printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
+    printf("│  + CLINT timer / software IRQ (IPI)  │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
