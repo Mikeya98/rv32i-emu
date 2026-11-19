@@ -5,6 +5,7 @@
  * v0.12 起支持多 hart: 一台机器 (emulator_t) 里有 N 个核 (hart_t),
  * 它们共享同一块物理内存, 但各自有寄存器、CSR、特权级和 LR/SC 保留集。
  * v0.13 补上 CLINT msip: 核间可以互相发软件中断 (IPI)。
+ * v0.14 补上 PLIC: 外部设备中断按优先级/阈值分发给各个核。
  */
 
 #ifndef _RVEMU_EMU_H
@@ -15,6 +16,7 @@
 #include "regfile.h"
 #include "csr.h"
 #include "decode.h"
+#include "plic.h"
 
 #define ELF_ENTRY_MAX   256   /* 入口地址 (运行时设置) */
 #define MAX_HARTS       4     /* 最多模拟几个核 */
@@ -72,6 +74,9 @@ typedef struct {
     /* CLINT 的 mtime 是全机器共享的: 每执行一条指令 +1,
      * 所有 hart 看到的是同一个时间轴。 */
     u64         mtime;
+
+    /* v0.14: 外部中断控制器 (所有 hart 共享, 每个 hart 一个上下文) */
+    plic_t      plic;
 
     u32         entry;              /* ELF 入口地址 (所有 hart 相同) */
     u32         exit_code;          /* 最后一个退出 hart 的退出码 */

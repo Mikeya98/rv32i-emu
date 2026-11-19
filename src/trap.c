@@ -116,13 +116,27 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
     }
 
     /*
+     * v0.14: 外部中断线由 PLIC 汇总。MEIP 是"线"而不是锁存的 pending:
+     * 只要还存在一条 使能 & 优先级 > 阈值 的 pending 源, MEIP 就为 1。
+     * claim 把 pending 清掉之后, 下一步这里就会自动把它拉低 ——
+     * 不需要软件手动清 mip。
+     */
+    if (plic_pending_for(&emu->plic, emu->cur)) {
+        csr->mip |= MIP_MEIP;
+    } else {
+        csr->mip &= ~MIP_MEIP;
+    }
+
+    /*
      * M 态取中断看 mstatus.MIE; U 态可以直接被 M 态中断打断
      * (规范和真机都是这样 —— 低特权级挡不住高特权级的中断)。
      *
-     * 优先级按规范: 机器外部 > 机器软件 > 机器定时器。本模拟器没有
-     * 外部中断, 所以只要同时 pending, 先报软件中断 (mcause = 3)。
+     * 优先级按规范: 机器外部 > 机器软件 > 机器定时器。
      */
     if (h->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE)) {
+        if ((csr->mip & MIP_MEIP) && (csr->mie & MIE_MEIE)) {
+            return trap_raise(emu, MCAUSE_IRQ_EXT, 0, epc);
+        }
         if ((csr->mip & MIP_MSIP) && (csr->mie & MIE_MSIE)) {
             return trap_raise(emu, MCAUSE_IRQ_SOFT, 0, epc);
         }

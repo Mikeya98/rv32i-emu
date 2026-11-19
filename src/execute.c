@@ -232,6 +232,23 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         }
 
         /*
+         * v0.14 PLIC: 优先级 / pending / enable / threshold / claim。
+         * 注意 claim 读有副作用 —— 读一次就领走一条中断, 所以
+         * 只允许 32 位 load 走到这里。
+         */
+        if (inst->funct3 == F3_LW &&
+            plic_mmio_read(&emu->plic, pa, &b32)) {
+            reg_write(&h->rf, inst->rd, b32);
+            break;
+        }
+
+        /* 虚拟设备门铃: 读回 0 (写才是触发) */
+        if (inst->funct3 == F3_LW && pa == PLIC_DEV_DOORBELL) {
+            reg_write(&h->rf, inst->rd, 0);
+            break;
+        }
+
+        /*
          * v0.13 CLINT msip: 每个 hart 一个 32 位寄存器, bit0 = 软件中断
          * pending。读它就是读电平, 清零要靠写 0。
          */
@@ -346,6 +363,24 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         if (xrc != 0) {
             fault_cause = xrc;
             goto except;
+        }
+
+        /*
+         * v0.14 PLIC: 写优先级 / enable / threshold, 以及写 claim =
+         * complete。同样只接 32 位 store。
+         */
+        if (inst->funct3 == F3_SW &&
+            plic_mmio_write(&emu->plic, pa, rs2_val)) {
+            break;
+        }
+
+        /*
+         * 虚拟设备: 往门铃寄存器写 1 到 bit n = 设备 n 触发一次中断。
+         * 这是整个中断链路的起点 —— 真实平台上换成 UART/网卡的寄存器。
+         */
+        if (inst->funct3 == F3_SW &&
+            plic_device_write(&emu->plic, pa, rs2_val)) {
+            break;
         }
 
         /*

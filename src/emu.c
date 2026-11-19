@@ -53,6 +53,12 @@ void emu_init_harts(emulator_t *emu, u32 nharts)
         emu->harts[i].state = EMU_HALTED;
     }
 
+    /*
+     * v0.14: PLIC 随机器一起复位。每个 hart 对应一个上下文
+     * (本模拟器只有 M 态上下文), 所以 enable/threshold 一起清零。
+     */
+    plic_init(&emu->plic);
+
     emu->nharts = nharts;
     emu->cur    = 0;
 }

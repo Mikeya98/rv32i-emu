@@ -70,6 +70,14 @@
 #define CLINT_MTIME_LO      0x0200BFF8u
 #define CLINT_MTIME_HI      0x0200BFFCu
 
+/*
+ * PLIC (v0.14): 外部中断控制器, 基址和寄存器布局见 plic.h。
+ *   0x0C000000 + 4*irq   优先级
+ *   0x0C001000           pending
+ *   0x0C002000 + 0x80*h  每个 hart 的使能字
+ *   0x0C200000 + 0x1000*h  threshold(+0) / claim-complete(+4)
+ */
+
 /* mstatus 位 */
 #define MSTATUS_SIE        (1u << 1)    /* S 态中断使能 */
 #define MSTATUS_MIE        (1u << 3)    /* 全局中断使能 */
@@ -113,11 +121,14 @@
 #define MIP_MSIP           (1u << 3)    /* 机器软件中断 pending */
 #define MIE_MTIE           (1u << 7)    /* 机器定时器中断使能 */
 #define MIP_MTIP           (1u << 7)    /* 机器定时器中断 pending */
+#define MIE_MEIE           (1u << 11)   /* 机器外部中断使能 (v0.14) */
+#define MIP_MEIP           (1u << 11)   /* 机器外部中断 pending */
 
 /* mcause: 最高位 = 1 表示中断, 否则是异常 */
 #define MCAUSE_IRQ_BIT     0x80000000u
 #define MCAUSE_IRQ_SOFT    (MCAUSE_IRQ_BIT | 3)   /* 3 = machine software (v0.13) */
 #define MCAUSE_IRQ_TIMER   (MCAUSE_IRQ_BIT | 7)   /* 7 = machine timer */
+#define MCAUSE_IRQ_EXT     (MCAUSE_IRQ_BIT | 11)  /* 11 = machine external (v0.14) */
 
 /* 异常码 (和 RISC-V 规范一致) */
 #define EXC_INST_MISALIGNED  0

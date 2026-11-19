@@ -30,8 +30,9 @@
 - **多 hart（v0.12）** — 最多 4 个核，每个 hart 有自己的寄存器、CSR、特权级、LR/SC 保留集和 `mtimecmp`，共享同一块物理内存；所有 hart 从同一入口启动，用 `mhartid` 分流（和真机固件的做法一致）；`emu_run` 按轮转顺序交错执行，结果确定可复现
 - **跨核原子语义** — 任何一个 hart 的普通 store / AMO / SC 写到某地址，都会让所有 hart 里针对该地址的 LR 保留失效，双核下的 `lr/sc` 不丢更新
 - **核间中断（v0.13）** — CLINT 的 `msip` 每个 hart 一个（`0x02000000 + 4*hartid`），写 1 拉起目标核的软件中断，写 0 撤掉；`mie.MSIE` / `mip.MSIP` / `mcause = 0x80000003` 全部接通。电平语义，handler 里不清就一直挂；同时 pending 时软件中断优先于定时器中断
+- **PLIC 外部中断（v0.14）** — 32 个中断源、每个 hart 一个上下文；优先级寄存器、pending、enable、threshold、claim/complete 全按 QEMU virt 的地址布局实现。设备写门铃寄存器拉起 pending，`mip.MEIP` 是"线"语义，claim 清掉 pending 后自动落下；`mie.MEIE` / `mcause = 0x8000000B` 接通，优先级按规范排序（外部 > 软件 > 定时器）
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 331 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 48 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 379 项，`make test` 全过
 
 ## 快速开始
 
@@ -76,6 +77,9 @@ make multihart-demo
 
 # 核间中断 demo：hart1 写 CLINT msip 给 hart0 发 IPI，handler 里清掉并打印 IPI55
 make ipi-demo
+
+# PLIC demo：设备同时拉起 3 条中断，handler 按优先级 claim/complete
+make plic-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -133,6 +137,7 @@ main.c → emu.c (fetch→decode→execute)
            ├── fpu.c       RV32F/D 浮点运算 + FMA + fflags/frm
            ├── debug.c     交互式调试器
            ├── trap.c      trap 框架 (异常/中断/mret) + 简化 CLINT
+           ├── plic.c      PLIC 外部中断控制器 + 虚拟设备门铃
            ├── mmu.c       Sv32 分页 (页表遍历 / 权限 / A-D 位)
            ├── regfile.c   寄存器文件 (x0-x31 + f0-f31 + PC)
            ├── memory.c    1MB 内存 + MMIO UART
@@ -207,6 +212,18 @@ FFFFF
 [SYSTEM] exit(0)
 ```
 
+`tests/gen_plic_demo.py` 演示外部中断。程序把 IRQ1/2/3 的优先级分别设成 1/3/2，全部使能、阈值设为 0，然后往虚拟设备的门铃寄存器写 `0b1110`。设备同时拉起三条中断线，CPU 在下一条指令边界进 trap（`mcause = 0x8000000B`）。handler 循环 claim，按优先级依次拿到 2、3、1，每条处理完写 claim 寄存器 complete；claim 返回 0 时置完成标志并 `mret`：
+
+```
+$ make plic-demo
+PLIC:231
+[SYSTEM] exit(0)
+```
+
+- `2` — IRQ2 优先级最高（3），先报
+- `3` — IRQ3 优先级次之（2）
+- `1` — IRQ1 最后（1）
+
 ## 进度
 
 | 模块 | 状态 |
@@ -230,6 +247,8 @@ FFFFF
 | RV32C 压缩指令 (16 位展开) | ✅ |
 | RV32D 双精度浮点 (NaN boxing) | ✅ |
 | 融合乘加 FMA.S / FMA.D | ✅ |
+| 多 hart + 跨核原子 + IPI (CLINT msip) | ✅ |
+| PLIC 外部中断 (优先级 / 阈值 / claim / complete) | ✅ |
 
 ## License
 

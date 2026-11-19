@@ -68,9 +68,10 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.13                │\n");
+    printf("│  RV32I Emulator v0.14                │\n");
     printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
     printf("│  + CLINT timer / software IRQ (IPI)  │\n");
+    printf("│  + PLIC external interrupts          │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
@@ -81,6 +82,7 @@ int main(int argc, char *argv[])
         rvc_selftest();
         execute_selftest();
         emu_selftest();
+        plic_selftest();
         trap_selftest();
         trap_smode_selftest();
         mmu_selftest();
