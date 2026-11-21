@@ -120,31 +120,85 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
      * 只要还存在一条 使能 & 优先级 > 阈值 的 pending 源, MEIP 就为 1。
      * claim 把 pending 清掉之后, 下一步这里就会自动把它拉低 ——
      * 不需要软件手动清 mip。
+     *
+     * v0.15: 每个 hart 有 M/S 两个 PLIC 上下文。M 上下文拉 MEIP,
+     * S 上下文拉 SEIP (sip.SEIP 是它的 S 态视图)。两条线各自独立:
+     * 设备挂在哪个上下文上, 就由哪一级处理。
      */
-    if (plic_pending_for(&emu->plic, emu->cur)) {
-        csr->mip |= MIP_MEIP;
-    } else {
-        csr->mip &= ~MIP_MEIP;
+    {
+        bool ext_m = plic_pending_for(&emu->plic, PLIC_CTX_M(emu->cur));
+        bool ext_s = plic_pending_for(&emu->plic, PLIC_CTX_S(emu->cur));
+
+        csr->mip = (csr->mip & ~(MIP_MEIP | MIP_SEIP)) |
+                   (ext_m ? MIP_MEIP : 0u) | (ext_s ? MIP_SEIP : 0u);
+        csr->sip = (csr->sip & ~MIP_SEIP) | (ext_s ? MIP_SEIP : 0u);
     }
 
     /*
      * M 态取中断看 mstatus.MIE; U 态可以直接被 M 态中断打断
      * (规范和真机都是这样 —— 低特权级挡不住高特权级的中断)。
-     *
-     * 优先级按规范: 机器外部 > 机器软件 > 机器定时器。
+     * S 态中断在 U 态照常可以打断, 在 S 态看 sstatus.SIE。
      */
-    if (h->priv != PRIV_M || (csr->mstatus & MSTATUS_MIE)) {
-        if ((csr->mip & MIP_MEIP) && (csr->mie & MIE_MEIE)) {
-            return trap_raise(emu, MCAUSE_IRQ_EXT, 0, epc);
+    {
+        bool m_ok = (h->priv != PRIV_M) || (csr->mstatus & MSTATUS_MIE);
+        bool s_ok = (h->priv == PRIV_U) ||
+                    (h->priv == PRIV_S && (csr->mstatus & MSTATUS_SIE));
+
+        /*
+         * 优先级按规范: 外部 > 软件 > 定时器。
+         * S 态外部中断排在机器级中断之后: 它属于低一级的目标。
+         */
+        if (m_ok) {
+            if ((csr->mip & MIP_MEIP) && (csr->mie & MIE_MEIE)) {
+                return trap_raise(emu, MCAUSE_IRQ_EXT, 0, epc);
+            }
+            if ((csr->mip & MIP_MSIP) && (csr->mie & MIE_MSIE)) {
+                return trap_raise(emu, MCAUSE_IRQ_SOFT, 0, epc);
+            }
+            if ((csr->mip & MIP_MTIP) && (csr->mie & MIE_MTIE)) {
+                return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
+            }
         }
-        if ((csr->mip & MIP_MSIP) && (csr->mie & MIE_MSIE)) {
-            return trap_raise(emu, MCAUSE_IRQ_SOFT, 0, epc);
-        }
-        if ((csr->mip & MIP_MTIP) && (csr->mie & MIE_MTIE)) {
-            return trap_raise(emu, MCAUSE_IRQ_TIMER, 0, epc);
+
+        if (csr->mip & MIP_SEIP) {
+            /*
+             * mideleg[9] = 1: S 外部中断委托给 S 态, 由 sie.SEIE 放行,
+             *                trap_raise 看到委托位会直接进 stvec。
+             * mideleg[9] = 0: 没委托, 由 M 态用 mie.SEIE 接管,
+             *                mcause = 9, 处理完再 mret 回去。
+             */
+            if (csr->mideleg & MIP_SEIP) {
+                if (s_ok && (csr->sie & MIE_SEIE)) {
+                    return trap_raise(emu, MCAUSE_IRQ_S_EXT, 0, epc);
+                }
+            } else if (m_ok && (csr->mie & MIE_SEIE)) {
+                return trap_raise(emu, MCAUSE_IRQ_S_EXT, 0, epc);
+            }
         }
     }
 
+    return false;
+}
+
+/*
+ * WFI 的唤醒条件 (v0.15)。
+ *
+ * 规范要求 WFI 在"本 hart 有中断 pending 且已使能"时恢复执行,
+ * 不管当时的全局中断开关是什么 —— 如果只是 mstatus.MIE/SIE 关着,
+ * 醒来之后继续往下跑, 不一定要立刻进 trap。
+ * 这里把 M 级 (mip & mie) 和 S 级 (sip & sie) 都算上。
+ */
+bool trap_irq_pending(emulator_t *emu)
+{
+    hart_t *h = emu_hart(emu);
+    csr_t *csr = &h->csr;
+
+    if (csr->mip & csr->mie & (MIP_MEIP | MIP_MSIP | MIP_MTIP | MIP_SEIP)) {
+        return true;
+    }
+    if (csr->sip & csr->sie & MIP_SEIP) {
+        return true;
+    }
     return false;
 }
 

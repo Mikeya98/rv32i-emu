@@ -58,6 +58,12 @@ typedef struct {
      */
     u32         msip;
 
+    /*
+     * v0.15: WFI 停在这里。waiting=1 时这条 hart 不再取指, 每个
+     * 指令边界只推进 mtime、检查中断; 中断到了就自动醒来接着跑。
+     */
+    bool        waiting;
+
     emu_state_t state;
 } hart_t;
 

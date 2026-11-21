@@ -47,6 +47,14 @@ bool trap_raise(emulator_t *emu, u32 cause, u32 tval, u32 epc);
 bool trap_check_interrupt(emulator_t *emu, u32 epc);
 
 /**
+ * @brief 当前 hart 是否有已使能的 pending 中断 (v0.15, 供 WFI 使用)
+ *
+ * 只看 pending & enable, 不看 mstatus.MIE/SIE —— WFI 的唤醒条件
+ * 和"能不能立刻进 trap"是两回事。
+ */
+bool trap_irq_pending(emulator_t *emu);
+
+/**
  * @brief mret: 从 trap handler 返回
  * @return 应该跳转到的 pc (mepc)
  */

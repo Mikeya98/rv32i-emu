@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo
 
 all: $(TARGET)
 
@@ -107,6 +107,12 @@ plic-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_plic_demo.py $(BUILDDIR)/plic_demo.elf
 	$(TARGET) $(BUILDDIR)/plic_demo.elf
+
+# S 态外部中断 + WFI demo: M 委托 SEI, S 态 WFI 等 hart1 拉门铃
+plic-s-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_plic_s_demo.py $(BUILDDIR)/plic_s_demo.elf
+	$(TARGET) --harts 2 $(BUILDDIR)/plic_s_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

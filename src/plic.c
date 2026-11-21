@@ -480,3 +480,168 @@ void plic_selftest(void)
     printf("\n  Result: %d passed, %d failed\n", plic_pass, plic_fail);
     emu_free(&emu);
 }
+
+/* ==================== v0.15: S 态上下文 / SEI / WFI ==================== */
+
+void plic_smode_selftest(void)
+{
+    emulator_t emu;
+    hart_t *h;
+    decoded_inst_t inst;
+    plic_t *p;
+    u32 v;
+
+    plic_pass = 0;
+    plic_fail = 0;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        S-mode PLIC / SEI / WFI Self-Test (v0.15)         ║\n");
+    printf("║        per-hart M/S context / delegation / wait state    ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    /* ---------- 1. 上下文编号 ---------- */
+    printf("── context numbering ──\n");
+    PLIC_CHECK(PLIC_CTX_M(0) == 0 && PLIC_CTX_S(0) == 1 &&
+               PLIC_CTX_M(1) == 2 && PLIC_CTX_S(1) == 3,
+               "hart h uses contexts 2h (M) and 2h+1 (S)");
+    PLIC_CHECK(PLIC_MAX_CTX >= 2 * MAX_HARTS,
+               "enough contexts for every hart's M and S view");
+
+    /* ---------- 2. 两个上下文互不影响 ---------- */
+    printf("\n── M and S contexts are independent ──\n");
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h = &emu.harts[0];
+    p = &emu.plic;
+
+    p->priority[4] = 5;
+    p->enable[PLIC_CTX_S(0)] = 1u << 4;
+    plic_raise(p, 4);
+    PLIC_CHECK(plic_pending_for(p, PLIC_CTX_S(0)),
+               "S context sees its enabled source");
+    PLIC_CHECK(!plic_pending_for(p, PLIC_CTX_M(0)),
+               "M context stays quiet for the same source");
+    PLIC_CHECK(!plic_pending_for(p, PLIC_CTX_S(1)),
+               "another hart's S context does not see it");
+
+    /* ---------- 3. S 外部中断委托给 S 态 ---------- */
+    printf("\n── delegated supervisor external interrupt ──\n");
+    plic_init(p);
+    p->priority[6] = 2;
+    p->enable[PLIC_CTX_S(0)] = 1u << 6;
+    plic_raise(p, 6);
+
+    h->priv  = PRIV_S;
+    h->csr.stvec = 0x700;
+    h->csr.mtvec = 0x900;
+    h->csr.mideleg = MIP_SEIP;          /* mideleg[9] */
+    h->csr.sie     = MIE_SEIE;
+    h->csr.mstatus = MSTATUS_SIE;
+    h->state = EMU_RUNNING;
+    put32(&emu, 0x600, 0x00000013u);    /* nop */
+    h->rf.pc = 0x600;
+    emu_step(&emu, &inst);
+
+    PLIC_CHECK(h->rf.pc == 0x700, "SEI traps to stvec");
+    PLIC_CHECK(h->csr.scause == MCAUSE_IRQ_S_EXT,
+               "scause = 0x80000009 (supervisor external)");
+    PLIC_CHECK(h->priv == PRIV_S, "handler stays in S-mode");
+    PLIC_CHECK((h->csr.sip & MIP_SEIP) != 0, "sip.SEIP reflects the line");
+    PLIC_CHECK((h->csr.mip & MIP_MEIP) == 0,
+               "M external line is not asserted by the S context");
+
+    /* handler 从 S 上下文 claim */
+    PLIC_CHECK(plic_mmio_read(p, PLIC_CLAIM(PLIC_CTX_S(0)), &v) && v == 6,
+               "S handler claims from context 2h+1");
+    PLIC_CHECK(plic_mmio_write(p, PLIC_CLAIM(PLIC_CTX_S(0)), 6) &&
+               p->in_service[PLIC_CTX_S(0)] == 0,
+               "complete through the S context");
+    PLIC_CHECK(!plic_pending_for(p, PLIC_CTX_S(0)),
+               "line drops after complete");
+
+    /* sret 回到被中断的指令, 不再重报 */
+    p->priority[6] = 2;
+    h->csr.sepc = 0x600;
+    h->csr.mstatus |= MSTATUS_SPIE;
+    put32(&emu, 0x700, 0x10200073u);    /* sret */
+    h->rf.pc = 0x700;
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x600 && h->priv == PRIV_S, "sret returns to sepc");
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x604, "claimed source does not retrigger");
+
+    /* ---------- 4. 没有委托时由 M 态接管 ---------- */
+    printf("\n── non-delegated SEI is taken in M-mode ──\n");
+    plic_init(p);
+    p->priority[5] = 3;
+    p->enable[PLIC_CTX_S(0)] |= 1u << 5;
+    plic_raise(p, 5);
+
+    h->priv  = PRIV_M;
+    h->csr.mideleg = 0;
+    h->csr.mtvec   = 0x900;
+    h->csr.mie     = MIE_SEIE;
+    h->csr.mstatus = MSTATUS_MIE;
+    put32(&emu, 0x620, 0x00000013u);
+    h->rf.pc = 0x620;
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x900, "SEI without mideleg goes to mtvec");
+    PLIC_CHECK(h->csr.mcause == MCAUSE_IRQ_S_EXT,
+               "mcause = 0x80000009 in M-mode");
+    PLIC_CHECK((h->csr.mip & MIP_SEIP) != 0, "mip.SEIP is visible in M-mode");
+
+    /* ---------- 5. WFI: 没有中断就停下来 ---------- */
+    printf("\n── WFI wait state ──\n");
+    emu_free(&emu);
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+
+    put32(&emu, 0x300, 0x10500073u);    /* wfi */
+    put32(&emu, 0x304, 0x00000013u);    /* nop */
+    h->state = EMU_RUNNING;
+    h->rf.pc = 0x300;
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->waiting, "wfi with no enabled interrupt enters wait state");
+    PLIC_CHECK(h->rf.pc == 0x304, "wfi consumes itself before waiting");
+
+    /* ---------- 6. WFI: 定时器中断唤醒 ---------- */
+    printf("\n── WFI wakes on a pending timer interrupt ──\n");
+    h->mtimecmp = emu.mtime + 5;
+    h->csr.mie  = MIE_MTIE;
+    h->csr.mtvec = 0x800;
+    h->csr.mstatus = 0;                 /* 全局中断关着: 醒来但不立刻进 trap */
+    emu_run(&emu, 2);
+    PLIC_CHECK(!h->waiting, "timer pending wakes the hart");
+    PLIC_CHECK((h->csr.mip & MIP_MTIP) != 0, "mip.MTIP set after the jump");
+
+    /* ---------- 7. WFI: 中断已经 pending 时立即完成 ---------- */
+    printf("\n── WFI is a no-op when an interrupt is already pending ──\n");
+    emu_free(&emu);
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->msip = 1;
+    h->csr.mie = MIE_MSIE;
+    h->csr.mstatus = 0;
+    put32(&emu, 0x300, 0x10500073u);
+    h->state = EMU_RUNNING;
+    h->rf.pc = 0x300;
+    emu_step(&emu, &inst);
+    PLIC_CHECK(!h->waiting, "pending MSIP prevents waiting");
+    PLIC_CHECK(h->rf.pc == 0x304, "pc still advances");
+
+    /* ---------- 8. 所有核等待且没有唤醒源 → 停机 ---------- */
+    printf("\n── deadlock detection ──\n");
+    emu_free(&emu);
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->waiting = true;
+    h->mtimecmp = 0;
+    emu_run(&emu, 0);
+    PLIC_CHECK(h->state == EMU_HALTED,
+               "all harts waiting with no timer → halted, not spinning");
+
+    printf("\n  Result: %d passed, %d failed\n", plic_pass, plic_fail);
+    emu_free(&emu);
+}

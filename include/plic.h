@@ -18,7 +18,9 @@
  *
  * 本模拟器的简化:
  *   - 32 个中断源 (IRQ 1..31), 每个上下文一个 32 位 enable 字
- *   - 每个 hart 一个上下文 (M 态); 不做 S 态上下文
+ *   - 每个 hart 两个上下文 (v0.15): M 态一个、S 态一个, 编号和
+ *     QEMU virt 一致 —— hart h 的 M 上下文是 2h, S 上下文是 2h+1。
+ *     M 上下文拉 mip.MEIP, S 上下文拉 mip.SEIP。
  *   - 中断源按边沿语义: 设备触发一次置 pending, claim 后不会自动重报
  *     (真实电平设备会在 complete 后重新拉起, 需要设备自己配合)
  */
@@ -30,7 +32,14 @@
 
 #define PLIC_BASE            0x0C000000u
 #define PLIC_MAX_IRQ         32          /* 含保留的 IRQ 0 */
-#define PLIC_MAX_CTX         4           /* 每个 hart 一个上下文 */
+#define PLIC_MAX_CTX         8           /* 每个 hart 两个上下文 (M/S) */
+
+/*
+ * 上下文编号 (v0.15): 和设备树里 QEMU virt 的写法一样,
+ *   hart h 的 M 态上下文 = 2h, S 态上下文 = 2h+1
+ */
+#define PLIC_CTX_M(hart)     (2u * (hart))
+#define PLIC_CTX_S(hart)     (2u * (hart) + 1u)
 
 /* 寄存器偏移 (和 QEMU virt 一致) */
 #define PLIC_PRIORITY(irq)   (PLIC_BASE + 4u * (irq))
@@ -87,5 +96,8 @@ bool plic_device_write(plic_t *p, u32 pa, u32 val);
 
 /** PLIC 自测 (v0.14) */
 void plic_selftest(void);
+
+/** S 态 PLIC 上下文 + SEI + WFI 自测 (v0.15) */
+void plic_smode_selftest(void);
 
 #endif /* _RVEMU_PLIC_H */

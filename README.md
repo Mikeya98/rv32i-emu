@@ -31,8 +31,9 @@
 - **跨核原子语义** — 任何一个 hart 的普通 store / AMO / SC 写到某地址，都会让所有 hart 里针对该地址的 LR 保留失效，双核下的 `lr/sc` 不丢更新
 - **核间中断（v0.13）** — CLINT 的 `msip` 每个 hart 一个（`0x02000000 + 4*hartid`），写 1 拉起目标核的软件中断，写 0 撤掉；`mie.MSIE` / `mip.MSIP` / `mcause = 0x80000003` 全部接通。电平语义，handler 里不清就一直挂；同时 pending 时软件中断优先于定时器中断
 - **PLIC 外部中断（v0.14）** — 32 个中断源、每个 hart 一个上下文；优先级寄存器、pending、enable、threshold、claim/complete 全按 QEMU virt 的地址布局实现。设备写门铃寄存器拉起 pending，`mip.MEIP` 是"线"语义，claim 清掉 pending 后自动落下；`mie.MEIE` / `mcause = 0x8000000B` 接通，优先级按规范排序（外部 > 软件 > 定时器）
+- **S 态 PLIC 上下文 + WFI（v0.15）** — 每个 hart 有 M/S 两个 PLIC 上下文（M = 2h、S = 2h+1，和 QEMU virt 一致）：M 上下文拉 `mip.MEIP`，S 上下文拉 `mip.SEIP`/`sip.SEIP`。`mideleg[9] = 1` 时 S 外部中断直接进 `stvec`（`scause = 0x80000009`），claim/complete 也走 S 上下文；没委托时由 M 态用 `mie.SEIE` 接管。`wfi` 在没有已使能中断时真的停下来（`hart->waiting`），中断到来后恢复；所有核都在 WFI 且没有定时器/外部源时判定死锁并停机，有 `mtimecmp` 则直接把 `mtime` 快进到最近的一次到期
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 48 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 379 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 73 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 404 项，`make test` 全过
 
 ## 快速开始
 
@@ -80,6 +81,9 @@ make ipi-demo
 
 # PLIC demo：设备同时拉起 3 条中断，handler 按优先级 claim/complete
 make plic-demo
+
+# S 态外部中断 + WFI：M 态委托 SEI，S 态 WFI 等另一个核拉门铃
+make plic-s-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -223,6 +227,14 @@ PLIC:231
 - `2` — IRQ2 优先级最高（3），先报
 - `3` — IRQ3 优先级次之（2）
 - `1` — IRQ1 最后（1）
+
+`tests/gen_plic_s_demo.py` 把 PLIC 接到 S 态。主核在 M 态设 `mideleg[9]`、配置自己的 S 上下文（ctx1），然后 `mret` 进 S 态，打印 `S` 后执行 `wfi`；辅助核空转一会儿，往门铃写 IRQ2。SEIP 拉起后主核从 WFI 醒来，直接陷进 `stvec`，handler 从 S 上下文 claim/complete，`sret` 回到 WFI 后面继续打印：
+
+```
+$ make plic-s-demo
+S:2
+[SYSTEM] ebreak: halted
+```
 
 ## 进度
 

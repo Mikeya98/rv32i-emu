@@ -35,6 +35,7 @@ static void hart_reset(hart_t *h, u32 hartid)
     h->reservation_addr  = 0;
     h->mtimecmp          = 0;               /* 0 = 定时器关闭 */
     h->msip              = 0;               /* v0.13: 复位时没有软件中断 */
+    h->waiting           = false;           /* v0.15: 复位后不在 WFI */
     h->state             = EMU_HALTED;
 }
 
@@ -145,6 +146,79 @@ u64 emu_run(emulator_t *emu, u64 max_steps)
                 break;
             }
         }
+
+        /*
+         * v0.15: 所有活着的核都在 WFI 里。这时候再一轮轮空转只是
+         * 浪费, 直接把 mtime 跳到最近的 mtimecmp; 如果没有核装过
+         * 定时器, 也没有任何 PLIC 源能唤醒它们, 那就是真死锁 ——
+         * 停机并报出来, 而不是让模拟器永远转下去。
+         */
+        if (any) {
+            bool all_wait = true;
+            bool have_timer = false;
+            u64 next = 0;
+
+            for (i = 0; i < emu->nharts; i++) {
+                if (emu->harts[i].state != EMU_RUNNING) continue;
+                if (!emu->harts[i].waiting) {
+                    all_wait = false;
+                    break;
+                }
+                if (emu->harts[i].mtimecmp != 0 &&
+                    emu->harts[i].mtimecmp > emu->mtime &&
+                    (!have_timer || emu->harts[i].mtimecmp < next)) {
+                    next = emu->harts[i].mtimecmp;
+                    have_timer = true;
+                }
+            }
+
+            if (all_wait) {
+                if (have_timer) {
+                    emu->mtime = (next > emu->mtime) ? next - 1u : emu->mtime;
+                } else {
+                    /*
+                     * 没有定时器不代表死锁: PLIC 可能刚被另一个核拉起来,
+                     * 而等待中的核还没轮到执行、mip 还没同步。先看有没有
+                     * 能唤醒的 PLIC 源; 真有才判定死锁。
+                     */
+                    bool have_ext = false;
+
+                    for (i = 0; i < emu->nharts; i++) {
+                        csr_t *csr;
+
+                        if (emu->harts[i].state != EMU_RUNNING) continue;
+                        csr = &emu->harts[i].csr;
+
+                        /*
+                         * 只有"使能了"的中断才能把 WFI 叫醒。光有 pending
+                         * 源但对应使能位是 0, 一样是死锁。
+                         */
+                        if (plic_pending_for(&emu->plic, PLIC_CTX_M(i)) &&
+                            (csr->mie & MIE_MEIE)) {
+                            have_ext = true;
+                            break;
+                        }
+                        if (plic_pending_for(&emu->plic, PLIC_CTX_S(i))) {
+                            u32 seie = (csr->mideleg & MIP_SEIP)
+                                     ? csr->sie : csr->mie;
+                            if (seie & MIE_SEIE) {
+                                have_ext = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!have_ext) {
+                        printf("[EMU] all harts in WFI with no interrupt source\n");
+                        for (i = 0; i < emu->nharts; i++) {
+                            if (emu->harts[i].state == EMU_RUNNING) {
+                                emu->harts[i].state = EMU_HALTED;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } while (any && (max_steps == 0 || steps < max_steps));
 
     return steps;
@@ -156,6 +230,25 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
     u32 raw;
     bool compressed = false;
     u32 pc = h->rf.pc;
+
+    /*
+     * 0a. v0.15: 这条 hart 停在 WFI 里。
+     *
+     * 不取指, 只走一遍中断检查: 有中断就醒(下一轮正常执行/进 trap),
+     * 没中断就消耗一个周期继续等。
+     */
+    if (h->waiting) {
+        if (trap_check_interrupt(emu, pc)) {
+            h->waiting = false;
+            h->csr.mcycle++;
+            return true;
+        }
+        if (trap_irq_pending(emu)) {
+            h->waiting = false;
+        }
+        h->csr.mcycle++;
+        return true;
+    }
 
     /*
      * 0. 指令边界上检查定时器中断。

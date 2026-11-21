@@ -764,6 +764,18 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 h->state = EMU_EXCEPTION;
                 break;
             }
+        } else if (inst->raw == 0x10500073) {       /* WFI (v0.15) */
+            /*
+             * 没有已使能的 pending 中断 → 停下等。它是一条"提示"指令,
+             * 规范允许实现成空操作; 这里实现成真正的等待, 好让多核
+             * demo 看到核在 WFI 里被 IPI/定时器唤醒。
+             *
+             * 有中断 pending 时 WFI 立即完成, 下一条指令边界就会
+             * 进 trap, 所以这种情况下什么都不用做。
+             */
+            if (!trap_irq_pending(emu)) {
+                h->waiting = true;
+            }
         } else if (inst->raw == 0x00100073) {       /* EBREAK */
             if (h->csr.mtvec != 0) {
                 if (!trap_raise(emu, EXC_BREAKPOINT, 0, pc)) {
