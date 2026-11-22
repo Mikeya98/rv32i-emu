@@ -20,6 +20,7 @@ void plic_init(plic_t *p)
         p->priority[i] = 0;
     }
     p->pending = 0;
+    p->level   = 0;
 
     for (i = 0; i < PLIC_MAX_CTX; i++) {
         p->enable[i]     = 0;
@@ -41,7 +42,38 @@ void plic_clear(plic_t *p, u32 irq)
     if (irq == 0 || irq >= PLIC_MAX_IRQ) {
         return;
     }
+    p->level   &= ~(1u << irq);
     p->pending &= ~(1u << irq);
+}
+
+static bool plic_in_service_any(const plic_t *p, u32 irq)
+{
+    u32 ctx;
+
+    for (ctx = 0; ctx < PLIC_MAX_CTX; ctx++) {
+        if (p->in_service[ctx] & (1u << irq)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void plic_set_level(plic_t *p, u32 irq, bool high)
+{
+    if (irq == 0 || irq >= PLIC_MAX_IRQ) {
+        return;
+    }
+
+    if (high) {
+        p->level |= (1u << irq);
+        /* 网关被 in-service 挡住时先不置 pending, complete 再看 */
+        if (!plic_in_service_any(p, irq)) {
+            p->pending |= (1u << irq);
+        }
+    } else {
+        p->level   &= ~(1u << irq);
+        p->pending &= ~(1u << irq);
+    }
 }
 
 bool plic_pending_for(const plic_t *p, u32 ctx)
@@ -107,6 +139,15 @@ void plic_complete(plic_t *p, u32 ctx, u32 irq)
         return;
     }
     p->in_service[ctx] &= ~(1u << irq);
+
+    /*
+     * v0.17: 电平设备在 complete 时如果线还在, 网关重新放行。
+     * 这是"中断风暴"的硬件根源 —— 驱动只 claim/complete、
+     * 忘了清设备, 中断会一直重报。
+     */
+    if ((p->level & (1u << irq)) && !plic_in_service_any(p, irq)) {
+        p->pending |= (1u << irq);
+    }
 }
 
 /* =========================== MMIO =========================== */
@@ -215,17 +256,25 @@ bool plic_device_write(plic_t *p, u32 pa, u32 val)
 {
     u32 irq;
 
-    if (pa != PLIC_DEV_DOORBELL) {
-        return false;
+    if (pa == PLIC_DEV_DOORBELL) {
+        /* 边沿门铃: 一次写可以同时触发多条中断线 */
+        for (irq = 1; irq < PLIC_MAX_IRQ; irq++) {
+            if (val & (1u << irq)) {
+                plic_raise(p, irq);
+            }
+        }
+        return true;
     }
 
-    /* 门铃: 一次写可以同时触发多条中断线 */
-    for (irq = 1; irq < PLIC_MAX_IRQ; irq++) {
-        if (val & (1u << irq)) {
-            plic_raise(p, irq);
+    if (pa == PLIC_DEV_LEVEL) {
+        /* 电平设备: 写的是整组线的当前电平, 0 表示设备撤线 */
+        for (irq = 1; irq < PLIC_MAX_IRQ; irq++) {
+            plic_set_level(p, irq, (val & (1u << irq)) != 0);
         }
+        return true;
     }
-    return true;
+
+    return false;
 }
 
 /* =========================== 自测 =========================== */
@@ -390,7 +439,7 @@ void plic_selftest(void)
                "doorbell write accepted");
     PLIC_CHECK((p->pending & ((1u << 5) | (1u << 6))) ==
                ((1u << 5) | (1u << 6)), "doorbell raises both sources");
-    PLIC_CHECK(plic_device_write(p, PLIC_DEV_DOORBELL + 4u, 1) == false,
+    PLIC_CHECK(plic_device_write(p, PLIC_DEV_DOORBELL + 8u, 1) == false,
                "unknown device address not claimed");
     plic_clear(p, 5);
     PLIC_CHECK((p->pending & (1u << 5)) == 0, "plic_clear drops a source");
@@ -641,6 +690,184 @@ void plic_smode_selftest(void)
     emu_run(&emu, 0);
     PLIC_CHECK(h->state == EMU_HALTED,
                "all harts waiting with no timer → halted, not spinning");
+
+    printf("\n  Result: %d passed, %d failed\n", plic_pass, plic_fail);
+    emu_free(&emu);
+}
+
+/* ==================== v0.17: 电平设备 / complete 重报 ==================== */
+
+void plic_level_selftest(void)
+{
+    emulator_t emu;
+    hart_t *h;
+    decoded_inst_t inst;
+    plic_t *p;
+    u32 v;
+
+    plic_pass = 0;
+    plic_fail = 0;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        Level Device / Re-Report Self-Test (v0.17)        ║\n");
+    printf("║        line level / gateway blocking / complete          ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h = &emu.harts[0];
+    p = &emu.plic;
+
+    /* ---------- 1. 拉线 / 撤线 ---------- */
+    printf("── line level ──\n");
+    plic_set_level(p, 4, true);
+    PLIC_CHECK((p->level & (1u << 4)) != 0, "asserting the line records its level");
+    PLIC_CHECK((p->pending & (1u << 4)) != 0, "level line sets pending");
+    PLIC_CHECK(!plic_pending_for(p, 0),
+               "still masked while priority is 0");
+
+    p->priority[4] = 3;
+    p->enable[0] = 1u << 4;
+    PLIC_CHECK(plic_pending_for(p, 0), "enabled level source interrupts");
+
+    plic_set_level(p, 4, false);
+    PLIC_CHECK((p->level & (1u << 4)) == 0, "deasserting clears the level");
+    PLIC_CHECK((p->pending & (1u << 4)) == 0,
+               "deasserting a pending level source clears pending too");
+    PLIC_CHECK(!plic_pending_for(p, 0), "no stale interrupt after the line drops");
+
+    /* ---------- 2. complete 时线仍高 → 重报 ---------- */
+    printf("\n── complete with the line still high ──\n");
+    plic_set_level(p, 4, true);
+    v = plic_claim(p, 0);
+    PLIC_CHECK(v == 4, "claim returns the level IRQ");
+    PLIC_CHECK((p->pending & (1u << 4)) == 0, "claim clears pending");
+    PLIC_CHECK((p->in_service[0] & (1u << 4)) != 0, "claim marks in-service");
+
+    plic_complete(p, 0, 4);
+    PLIC_CHECK((p->in_service[0] & (1u << 4)) == 0, "complete clears in-service");
+    PLIC_CHECK((p->pending & (1u << 4)) != 0,
+               "line still high → complete re-raises pending");
+    v = plic_claim(p, 0);
+    PLIC_CHECK(v == 4, "the same IRQ can be claimed again");
+
+    /* ---------- 3. 服务期间撤线 → complete 不重报 ---------- */
+    printf("\n── deassert while in service ──\n");
+    plic_set_level(p, 4, false);
+    PLIC_CHECK((p->pending & (1u << 4)) == 0, "deassert clears pending mid-service");
+    PLIC_CHECK((p->in_service[0] & (1u << 4)) != 0, "in-service is unaffected");
+    plic_complete(p, 0, 4);
+    PLIC_CHECK((p->pending & (1u << 4)) == 0,
+               "complete with a low line does not re-raise");
+
+    /* ---------- 4. 网关挡住服务期间的高电平 ---------- */
+    printf("\n── gateway blocks while in service ──\n");
+    plic_set_level(p, 4, true);
+    v = plic_claim(p, 0);
+    plic_set_level(p, 4, false);
+    plic_set_level(p, 4, true);         /* 服务期间再拉高 */
+    PLIC_CHECK(v == 4 && (p->pending & (1u << 4)) == 0,
+               "an edge during service does not set pending");
+    plic_complete(p, 0, 4);
+    PLIC_CHECK((p->pending & (1u << 4)) != 0,
+               "pending appears when the gateway reopens");
+    plic_set_level(p, 4, false);
+
+    /* ---------- 5. 边沿源不重报 ---------- */
+    printf("\n── edge source stays quiet ──\n");
+    plic_init(p);
+    p->priority[5] = 1;
+    p->enable[0] = 1u << 5;
+    plic_raise(p, 5);
+    PLIC_CHECK(plic_claim(p, 0) == 5, "edge IRQ claimed");
+    plic_complete(p, 0, 5);
+    PLIC_CHECK((p->pending & (1u << 5)) == 0,
+               "edge source has no line to re-raise it");
+
+    /* ---------- 6. threshold 只挡通知, 不丢 pending ---------- */
+    printf("\n── threshold and level ──\n");
+    plic_init(p);
+    plic_set_level(p, 6, true);
+    p->priority[6] = 2;
+    p->enable[0] = 1u << 6;
+    p->threshold[0] = 2;
+    PLIC_CHECK(!plic_pending_for(p, 0), "threshold masks the notification");
+    PLIC_CHECK(plic_claim(p, 0) == 0, "claim respects the threshold");
+    PLIC_CHECK((p->pending & (1u << 6)) != 0, "the line stays pending");
+    p->threshold[0] = 0;
+    PLIC_CHECK(plic_pending_for(p, 0), "lowering the threshold releases it");
+    plic_set_level(p, 6, false);
+
+    /* ---------- 7. 重报对上下文的可见性 ---------- */
+    printf("\n── re-report is per-context ──\n");
+    plic_init(p);
+    plic_set_level(p, 7, true);
+    p->priority[7] = 5;
+    p->enable[0] = 1u << 7;
+    p->enable[1] = 0;
+    plic_claim(p, 0);
+    plic_complete(p, 0, 7);
+    PLIC_CHECK(plic_pending_for(p, 0), "ctx0 sees the re-report");
+    PLIC_CHECK(!plic_pending_for(p, 1), "ctx1 still has it disabled");
+    plic_set_level(p, 7, false);
+
+    /* ---------- 8. MMIO 电平寄存器 ---------- */
+    printf("\n── level device register ──\n");
+    PLIC_CHECK(plic_device_write(p, PLIC_DEV_LEVEL, (1u << 8) | (1u << 9)),
+               "level register write accepted");
+    PLIC_CHECK((p->level & ((1u << 8) | (1u << 9))) ==
+               ((1u << 8) | (1u << 9)), "write sets both lines");
+    PLIC_CHECK((p->pending & ((1u << 8) | (1u << 9))) ==
+               ((1u << 8) | (1u << 9)), "both sources become pending");
+    PLIC_CHECK(plic_device_write(p, PLIC_DEV_LEVEL, 1u << 8),
+               "second write accepted");
+    PLIC_CHECK((p->level & (1u << 9)) == 0, "clearing bit 9 drops that line");
+    PLIC_CHECK((p->pending & (1u << 9)) == 0, "and its pending bit");
+    plic_device_write(p, PLIC_DEV_LEVEL, 0);
+
+    /* ---------- 9. 中断风暴与清线 ---------- */
+    printf("\n── integration: storm until the line is cleared ──\n");
+    emu_free(&emu);
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    p = &emu.plic;
+
+    p->priority[7] = 4;
+    p->enable[0] = 1u << 7;
+    plic_set_level(p, 7, true);
+
+    h->state = EMU_RUNNING;
+    h->csr.mtvec = 0x800;
+    h->csr.mie = MIE_MEIE;
+    h->csr.mstatus = MSTATUS_MIE;
+    put32(&emu, 0x100, 0x00000013u);    /* nop */
+    put32(&emu, 0x800, enc_lui(0x0C200u, 1));
+    put32(&emu, 0x804, enc_i(4, 1, 2, 5, 0x03));   /* lw  x5, 4(x1)  claim   */
+    put32(&emu, 0x808, enc_s(4, 5, 1, 2));         /* sw  x5, 4(x1)  complete */
+    put32(&emu, 0x80C, 0x30200073u);               /* mret */
+    h->rf.pc = 0x100;
+
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x800, "level IRQ traps to mtvec");
+    emu_step(&emu, &inst);                          /* lui   */
+    emu_step(&emu, &inst);                          /* claim */
+    emu_step(&emu, &inst);                          /* complete, line still high */
+    emu_step(&emu, &inst);                          /* mret */
+    PLIC_CHECK(h->rf.pc == 0x100, "mret returns to the interrupted instruction");
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x800,
+               "handler forgot to clear the device → traps again");
+
+    /* 第二次进 handler 前把线撤掉, 再 claim/complete 就安静了 */
+    plic_set_level(p, 7, false);
+    emu_step(&emu, &inst);                          /* lui   */
+    emu_step(&emu, &inst);                          /* claim */
+    emu_step(&emu, &inst);                          /* complete */
+    emu_step(&emu, &inst);                          /* mret */
+    PLIC_CHECK(h->rf.pc == 0x100, "second handler returns cleanly");
+    emu_step(&emu, &inst);
+    PLIC_CHECK(h->rf.pc == 0x104, "after clearing the line the storm stops");
 
     printf("\n  Result: %d passed, %d failed\n", plic_pass, plic_fail);
     emu_free(&emu);

@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo level-demo
 
 all: $(TARGET)
 
@@ -119,6 +119,12 @@ stip-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_stip_demo.py $(BUILDDIR)/stip_demo.elf
 	$(TARGET) $(BUILDDIR)/stip_demo.elf
+
+# 电平设备 demo: complete 后线还高 → 重报, 清线后停止 (中断风暴)
+level-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_level_demo.py $(BUILDDIR)/level_demo.elf
+	$(TARGET) $(BUILDDIR)/level_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

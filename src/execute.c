@@ -248,6 +248,12 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             break;
         }
 
+        /* 虚拟电平设备: 读回当前线电平 (v0.17) */
+        if (inst->funct3 == F3_LW && pa == PLIC_DEV_LEVEL) {
+            reg_write(&h->rf, inst->rd, emu->plic.level);
+            break;
+        }
+
         /*
          * v0.13 CLINT msip: 每个 hart 一个 32 位寄存器, bit0 = 软件中断
          * pending。读它就是读电平, 清零要靠写 0。

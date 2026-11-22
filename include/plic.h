@@ -21,8 +21,11 @@
  *   - 每个 hart 两个上下文 (v0.15): M 态一个、S 态一个, 编号和
  *     QEMU virt 一致 —— hart h 的 M 上下文是 2h, S 上下文是 2h+1。
  *     M 上下文拉 mip.MEIP, S 上下文拉 mip.SEIP。
- *   - 中断源按边沿语义: 设备触发一次置 pending, claim 后不会自动重报
- *     (真实电平设备会在 complete 后重新拉起, 需要设备自己配合)
+ *   - 两种设备语义 (v0.17):
+ *       边沿 (plic_raise): 触发一次置 pending, claim 后不自动重报;
+ *       电平 (plic_set_level): 线保持高电平, claim 时清 pending,
+ *       complete 时如果线还高就重新置 pending —— 这就是真实 PLIC
+ *       gateway 的行为, 驱动必须在 complete 之前把设备的中断清掉。
  */
 
 #ifndef _RVEMU_PLIC_H
@@ -59,10 +62,13 @@
  */
 #define PLIC_DEV_BASE        0x10000000u
 #define PLIC_DEV_DOORBELL    (PLIC_DEV_BASE + 0x00u)
+/* v0.17: 电平设备。写整个掩码, bit n = 1 拉高 IRQ n 的线, 0 撤掉。 */
+#define PLIC_DEV_LEVEL       (PLIC_DEV_BASE + 0x04u)
 
 typedef struct {
     u32 priority[PLIC_MAX_IRQ];   /* priority[0] 保留, 写 0 表示关闭 */
     u32 pending;                  /* bit i = IRQ i 等待处理 */
+    u32 level;                    /* v0.17: 电平设备当前拉高的线 */
     u32 enable[PLIC_MAX_CTX];     /* 每个上下文一个使能字 */
     u32 threshold[PLIC_MAX_CTX];  /* 优先级必须严格大于它才通知 */
     u32 in_service[PLIC_MAX_CTX]; /* claim 之后、complete 之前 */
@@ -77,6 +83,14 @@ void plic_raise(plic_t *p, u32 irq);
 
 /** 撤掉一条中断线 (调试/电平设备用) */
 void plic_clear(plic_t *p, u32 irq);
+
+/**
+ * 电平设备: 设置 IRQ 线的电平 (v0.17)。
+ * 拉高时如果该 IRQ 不在服务中, 置 pending; 撤线时清 pending。
+ * claim 之后、complete 之前网关被挡住, 期间拉高不会置 pending;
+ * complete 时线仍然为高, 会重新置 pending。
+ */
+void plic_set_level(plic_t *p, u32 irq, bool high);
 
 /** 该上下文此刻是否有一条够格通知 CPU 的中断 */
 bool plic_pending_for(const plic_t *p, u32 ctx);
@@ -99,5 +113,8 @@ void plic_selftest(void);
 
 /** S 态 PLIC 上下文 + SEI + WFI 自测 (v0.15) */
 void plic_smode_selftest(void);
+
+/** 电平设备 / complete 后重报自测 (v0.17) */
+void plic_level_selftest(void);
 
 #endif /* _RVEMU_PLIC_H */
