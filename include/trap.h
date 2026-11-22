@@ -69,5 +69,6 @@ u32 trap_sret(emulator_t *emu);
 /** 自测 */
 void trap_selftest(void);
 void trap_smode_selftest(void);
+void trap_stimer_selftest(void);   /* v0.16: STIP + Sstc stimecmp */
 
 #endif /* _RVEMU_TRAP_H */

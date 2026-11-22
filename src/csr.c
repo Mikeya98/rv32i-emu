@@ -30,6 +30,8 @@ u32 csr_read(csr_t *csr, u32 addr, bool *ok)
     case CSR_SCAUSE:   return csr->scause;
     case CSR_STVAL:    return csr->stval;
     case CSR_SIP:      return csr->sip;
+    case CSR_STIMECMP:  return (u32)(csr->stimecmp & 0xFFFFFFFF);
+    case CSR_STIMECMPH: return (u32)(csr->stimecmp >> 32);
     case CSR_MEDELEG:  return csr->medeleg;
     case CSR_MIDELEG:  return csr->mideleg;
     case CSR_MIE:      return csr->mie;
@@ -63,13 +65,25 @@ void csr_write(csr_t *csr, u32 addr, u32 val, bool *ok)
     case CSR_SSTATUS:
         csr->mstatus = (csr->mstatus & ~SSTATUS_MASK) | (val & SSTATUS_MASK);
         break;
-    case CSR_SIE:      csr->sie      = val; break;
+    case CSR_SIE:      csr->sie      = val & SIP_MASK; break;
     case CSR_STVEC:    csr->stvec    = val & ~0x3u; break;
     case CSR_SSCRATCH: csr->sscratch = val; break;
     case CSR_SEPC:     csr->sepc     = val & ~0x3u; break;
     case CSR_SCAUSE:   csr->scause   = val; break;
     case CSR_STVAL:    csr->stval    = val; break;
-    case CSR_SIP:      csr->sip     &= val; break;   /* 软件只能清 pending */
+    /*
+     * sip 里 S 态软件只能写 SSIP; STIP/SEIP 是硬件拉的电平线, 对 S 态
+     * 只读。写 0 到 STIP 不会让它消失 —— 来源还在, 下一步照样置起来。
+     */
+    case CSR_SIP:
+        csr->sip = (csr->sip & ~MIP_SSIP) | (val & MIP_SSIP);
+        break;
+    case CSR_STIMECMP:
+        csr->stimecmp = (csr->stimecmp & 0xFFFFFFFF00000000ULL) | (u32)val;
+        break;
+    case CSR_STIMECMPH:
+        csr->stimecmp = (csr->stimecmp & 0xFFFFFFFFULL) | ((u64)val << 32);
+        break;
     case CSR_MEDELEG:  csr->medeleg  = val & 0xFFFFu; break;
     case CSR_MIDELEG:  csr->mideleg  = val & 0xFFFFu; break;
     /*
@@ -90,7 +104,15 @@ void csr_write(csr_t *csr, u32 addr, u32 val, bool *ok)
     case CSR_MEPC:     csr->mepc     = val & ~0x3u; break;  /* 4 字节对齐 */
     case CSR_MCAUSE:   csr->mcause   = val; break;
     case CSR_MTVAL:    csr->mtval    = val; break;
-    case CSR_MIP:      csr->mip     &= val; break;   /* 软件只能清 pending 位 */
+    /*
+     * M 态能直接拉/撤 STIP (真实平台上 M 态固件就是这么转发 S 定时器
+     * 中断的)。MSIP/MTIP/MEIP/SEIP 都是外部电平线, 每步由 CLINT/PLIC
+     * 重新算, 写 mip 对它们没有意义。
+     */
+    case CSR_MIP:
+        csr->stip_sw = (val & MIP_STIP) ? 1u : 0u;
+        csr->mip = (csr->mip & ~MIP_STIP) | (csr->stip_sw ? MIP_STIP : 0u);
+        break;
     case CSR_MCYCLE:   csr->mcycle   = (csr->mcycle & 0xFFFFFFFF00000000ULL) | val; break;
     default:
         if (ok) *ok = false;
@@ -145,6 +167,10 @@ void csr_dump(csr_t *csr)
            csr->stvec, csr->sepc, csr->scause, csr->stval);
     printf("  medeleg  = 0x%08X  mideleg = 0x%08X\n",
            csr->medeleg, csr->mideleg);
+    printf("  stimecmp = %llu  (STIP=%u, timer %s)\n",
+           (unsigned long long)csr->stimecmp,
+           (csr->mip & MIP_STIP) ? 1u : 0u,
+           csr->stimecmp ? "armed" : "off");
     printf("  fcsr     = 0x%02X  (frm=%u fflags=0x%02X)\n",
            ((csr->frm & 7u) << 5) | (csr->fflags & 0x1Fu),
            csr->frm & 7u, csr->fflags & 0x1Fu);

@@ -29,6 +29,8 @@
 #define CSR_SCAUSE      0x142
 #define CSR_STVAL       0x143
 #define CSR_SIP         0x144
+#define CSR_STIMECMP    0x14D   /* Sstc: S 态定时器比较值 (低 32 位, v0.16) */
+#define CSR_STIMECMPH   0x15D   /* Sstc: S 态定时器比较值 (高 32 位) */
 #define CSR_SATP        0x180
 #define CSR_FFLAGS      0x001   /* 浮点异常标志 (v0.8 RV32F) */
 #define CSR_FRM         0x002   /* 浮点舍入模式 */
@@ -126,6 +128,16 @@
 #define MIP_MEIP           (1u << 11)   /* 机器外部中断 pending */
 #define MIE_SEIE           (1u << 9)    /* S 态外部中断使能 (v0.15) */
 #define MIP_SEIP           (1u << 9)    /* S 态外部中断 pending */
+#define MIE_STIE           (1u << 5)    /* S 态定时器中断使能 (v0.16) */
+#define MIP_STIP           (1u << 5)    /* S 态定时器中断 pending */
+#define MIE_SSIE           (1u << 1)    /* 保留定义: S 态软件中断 */
+#define MIP_SSIP           (1u << 1)
+
+/*
+ * sip/sie 只暴露 S 态能看到的那几位。STIP 和 SEIP 对 S 态是只读的
+ * (由平台/PLIC 拉线), 只有 SSIP 允许 S 态软件写。
+ */
+#define SIP_MASK           (MIP_SSIP | MIP_STIP | MIP_SEIP)
 
 /* mcause: 最高位 = 1 表示中断, 否则是异常 */
 #define MCAUSE_IRQ_BIT     0x80000000u
@@ -133,6 +145,7 @@
 #define MCAUSE_IRQ_TIMER   (MCAUSE_IRQ_BIT | 7)   /* 7 = machine timer */
 #define MCAUSE_IRQ_EXT     (MCAUSE_IRQ_BIT | 11)  /* 11 = machine external (v0.14) */
 #define MCAUSE_IRQ_S_EXT   (MCAUSE_IRQ_BIT | 9)   /* 9 = supervisor external (v0.15) */
+#define MCAUSE_IRQ_S_TIMER (MCAUSE_IRQ_BIT | 5)   /* 5 = supervisor timer (v0.16) */
 
 /* 异常码 (和 RISC-V 规范一致) */
 #define EXC_INST_MISALIGNED  0
@@ -166,6 +179,20 @@ typedef struct {
     u32  sscratch;
     u32  sie;
     u32  sip;
+
+    /*
+     * v0.16: STIP 是一个电平信号, 有两个来源 —— M 态软件写 mip.STIP,
+     * 以及 Sstc 的 stimecmp 定时器 (stimecmp 在 hart_t 里)。这里记录
+     * 软件拉起来的那一路, 每步和定时器那一路"或"起来写进 mip.STIP。
+     */
+    u32  stip_sw;
+
+    /*
+     * v0.16 (Sstc): S 态定时器比较值。mtime 追平它就用平台线拉起
+     * mip.STIP; 0 表示关闭。RV32 通过 stimecmp/stimecmph 两个 CSR
+     * 访问低/高 32 位。
+     */
+    u64  stimecmp;
 
     /* 委托: 当前级 <= S 时, 对应位为 1 的 trap 交给 S 态处理 */
     u32  medeleg;

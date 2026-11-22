@@ -32,8 +32,9 @@
 - **核间中断（v0.13）** — CLINT 的 `msip` 每个 hart 一个（`0x02000000 + 4*hartid`），写 1 拉起目标核的软件中断，写 0 撤掉；`mie.MSIE` / `mip.MSIP` / `mcause = 0x80000003` 全部接通。电平语义，handler 里不清就一直挂；同时 pending 时软件中断优先于定时器中断
 - **PLIC 外部中断（v0.14）** — 32 个中断源、每个 hart 一个上下文；优先级寄存器、pending、enable、threshold、claim/complete 全按 QEMU virt 的地址布局实现。设备写门铃寄存器拉起 pending，`mip.MEIP` 是"线"语义，claim 清掉 pending 后自动落下；`mie.MEIE` / `mcause = 0x8000000B` 接通，优先级按规范排序（外部 > 软件 > 定时器）
 - **S 态 PLIC 上下文 + WFI（v0.15）** — 每个 hart 有 M/S 两个 PLIC 上下文（M = 2h、S = 2h+1，和 QEMU virt 一致）：M 上下文拉 `mip.MEIP`，S 上下文拉 `mip.SEIP`/`sip.SEIP`。`mideleg[9] = 1` 时 S 外部中断直接进 `stvec`（`scause = 0x80000009`），claim/complete 也走 S 上下文；没委托时由 M 态用 `mie.SEIE` 接管。`wfi` 在没有已使能中断时真的停下来（`hart->waiting`），中断到来后恢复；所有核都在 WFI 且没有定时器/外部源时判定死锁并停机，有 `mtimecmp` 则直接把 `mtime` 快进到最近的一次到期
+- **S 态定时器中断（v0.16）** — 实现 Sstc 的 `stimecmp`/`stimecmph`（64 位比较值，RV32 拆两个 CSR）：`mtime` 追平比较值就把 `mip.STIP`/`sip.STIP` 拉成电平。`mideleg[5] = 1` 时 S 定时器中断直接进 `stvec`（`scause = 0x80000005`），否则由 M 态用 `mie.STIE` 接管；M 态软件也可以直接写 `mip.STIP` 转发。委托出去的中断不打断 M 态，`sip.STIP` 对 S 态只读，WFI 的唤醒条件和死锁快进都算上了 `stimecmp`
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 73 项 + trap 20 项 + S 态/委托 30 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 404 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 73 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 435 项，`make test` 全过
 
 ## 快速开始
 
@@ -84,6 +85,9 @@ make plic-demo
 
 # S 态外部中断 + WFI：M 态委托 SEI，S 态 WFI 等另一个核拉门铃
 make plic-s-demo
+
+# S 态定时器 demo：stimecmp 到点 → STIP → stvec，WFI 等待并打印 S123
+make stip-demo
 
 # 在调试器里打开同一个程序
 make debug-demo
@@ -236,6 +240,14 @@ S:2
 [SYSTEM] ebreak: halted
 ```
 
+`tests/gen_stip_demo.py` 演示 S 态定时器。M 态设 `stvec`、`mideleg[5]`、`sie.STIE`，把 `stimecmp` 设成 40，然后 `mret` 进 S 态。S 态打印 `S` 后在 `wfi` 里等；`mtime` 追平 `stimecmp` 时 `mip.STIP` 拉起，直接陷进 `stvec`（`scause = 0x80000005`）。handler 每次打一个序号、把 `stimecmp` 往后推 20；第三次之后关掉定时器并把 `sepc` 指到出口，`sret` 直接回主流程打印换行：
+
+```
+$ make stip-demo
+S123
+[SYSTEM] ebreak: halted
+```
+
 ## 进度
 
 | 模块 | 状态 |
@@ -261,6 +273,7 @@ S:2
 | 融合乘加 FMA.S / FMA.D | ✅ |
 | 多 hart + 跨核原子 + IPI (CLINT msip) | ✅ |
 | PLIC 外部中断 (优先级 / 阈值 / claim / complete) | ✅ |
+| S 态定时器中断 (Sstc stimecmp / STIP 委托 / WFI) | ✅ |
 
 ## License
 

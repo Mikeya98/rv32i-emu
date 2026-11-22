@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo
 
 all: $(TARGET)
 
@@ -113,6 +113,12 @@ plic-s-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_plic_s_demo.py $(BUILDDIR)/plic_s_demo.elf
 	$(TARGET) --harts 2 $(BUILDDIR)/plic_s_demo.elf
+
+# S 态定时器中断 demo: stimecmp 到点 → STIP → stvec, WFI 等待/唤醒
+stip-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_stip_demo.py $(BUILDDIR)/stip_demo.elf
+	$(TARGET) $(BUILDDIR)/stip_demo.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

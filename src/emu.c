@@ -164,11 +164,23 @@ u64 emu_run(emulator_t *emu, u64 max_steps)
                     all_wait = false;
                     break;
                 }
-                if (emu->harts[i].mtimecmp != 0 &&
-                    emu->harts[i].mtimecmp > emu->mtime &&
-                    (!have_timer || emu->harts[i].mtimecmp < next)) {
-                    next = emu->harts[i].mtimecmp;
-                    have_timer = true;
+                /*
+                 * v0.16: 两种定时器都算数 —— 机器定时器 (mtimecmp) 和
+                 * S 态定时器 (Sstc 的 stimecmp)。谁先到期就快进到谁。
+                 */
+                {
+                    const hart_t *h = &emu->harts[i];
+
+                    if (h->mtimecmp != 0 && h->mtimecmp > emu->mtime &&
+                        (!have_timer || h->mtimecmp < next)) {
+                        next = h->mtimecmp;
+                        have_timer = true;
+                    }
+                    if (h->csr.stimecmp != 0 && h->csr.stimecmp > emu->mtime &&
+                        (!have_timer || h->csr.stimecmp < next)) {
+                        next = h->csr.stimecmp;
+                        have_timer = true;
+                    }
                 }
             }
 

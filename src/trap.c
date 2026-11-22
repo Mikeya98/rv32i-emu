@@ -106,6 +106,23 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
     }
 
     /*
+     * v0.16 (Sstc): STIP 也是一个电平信号, 有两个来源 ——
+     *   - S 态通过 stimecmp 装了一个比较值, mtime 追平就拉起来
+     *   - M 态软件直接写 mip.STIP (模拟 M 态固件转发定时器中断)
+     * 两个来源"或"在一起, 和真机上多个中断源共用一个 pending 位一致。
+     */
+    {
+        bool stip = (csr->stip_sw != 0) ||
+                    (csr->stimecmp != 0 && emu->mtime >= csr->stimecmp);
+
+        if (stip) {
+            csr->mip |= MIP_STIP;
+        } else {
+            csr->mip &= ~MIP_STIP;
+        }
+    }
+
+    /*
      * v0.13: 软件中断也是电平信号, 由 CLINT msip 寄存器拉起来。
      * 这里每步同步一次 mip, 保证软件读到的 pending 位和 CLINT 一致。
      */
@@ -131,7 +148,11 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
 
         csr->mip = (csr->mip & ~(MIP_MEIP | MIP_SEIP)) |
                    (ext_m ? MIP_MEIP : 0u) | (ext_s ? MIP_SEIP : 0u);
-        csr->sip = (csr->sip & ~MIP_SEIP) | (ext_s ? MIP_SEIP : 0u);
+
+        /* sip 是 mip 在 S 态可见的那几位: SEIP 来自 PLIC, STIP 来自上一段 */
+        csr->sip = (csr->sip & ~(MIP_SEIP | MIP_STIP)) |
+                   (ext_s ? MIP_SEIP : 0u) |
+                   ((csr->mip & MIP_STIP) ? MIP_STIP : 0u);
     }
 
     /*
@@ -160,19 +181,36 @@ bool trap_check_interrupt(emulator_t *emu, u32 epc)
             }
         }
 
+        /*
+         * S 级中断: 外部优先于定时器。
+         *
+         * mideleg[9/5] = 1: 委托给 S 态, 由 sie 里对应使能位放行,
+         *                   trap_raise 看到委托位就会直接进 stvec。
+         * mideleg[9/5] = 0: 没委托, 由 M 态用 mie 里同一个位接管,
+         *                   mcause/scause 的编号不变, 处理完 mret 回去。
+         */
         if (csr->mip & MIP_SEIP) {
-            /*
-             * mideleg[9] = 1: S 外部中断委托给 S 态, 由 sie.SEIE 放行,
-             *                trap_raise 看到委托位会直接进 stvec。
-             * mideleg[9] = 0: 没委托, 由 M 态用 mie.SEIE 接管,
-             *                mcause = 9, 处理完再 mret 回去。
-             */
             if (csr->mideleg & MIP_SEIP) {
                 if (s_ok && (csr->sie & MIE_SEIE)) {
                     return trap_raise(emu, MCAUSE_IRQ_S_EXT, 0, epc);
                 }
             } else if (m_ok && (csr->mie & MIE_SEIE)) {
                 return trap_raise(emu, MCAUSE_IRQ_S_EXT, 0, epc);
+            }
+        }
+
+        if (csr->mip & MIP_STIP) {
+            /*
+             * v0.16: 委托出去的 S 定时器中断在 M 态不投递 —— 和 S 外部
+             * 中断一样, delegated 中断只打断 S/U 态。M 态自己用 STIE
+             * 接管的那条路径则看 mstatus.MIE。
+             */
+            if (csr->mideleg & MIP_STIP) {
+                if (s_ok && (csr->sie & MIE_STIE)) {
+                    return trap_raise(emu, MCAUSE_IRQ_S_TIMER, 0, epc);
+                }
+            } else if (m_ok && (csr->mie & MIE_STIE)) {
+                return trap_raise(emu, MCAUSE_IRQ_S_TIMER, 0, epc);
             }
         }
     }
@@ -193,10 +231,11 @@ bool trap_irq_pending(emulator_t *emu)
     hart_t *h = emu_hart(emu);
     csr_t *csr = &h->csr;
 
-    if (csr->mip & csr->mie & (MIP_MEIP | MIP_MSIP | MIP_MTIP | MIP_SEIP)) {
+    if (csr->mip & csr->mie &
+        (MIP_MEIP | MIP_MSIP | MIP_MTIP | MIP_SEIP | MIP_STIP)) {
         return true;
     }
-    if (csr->sip & csr->sie & MIP_SEIP) {
+    if (csr->sip & csr->sie & (MIP_SEIP | MIP_STIP)) {
         return true;
     }
     return false;
@@ -528,5 +567,225 @@ void trap_smode_selftest(void)
     TRAP_CHECK(h->rf.pc == 0x500, "U executing sret → illegal → S");
     TRAP_CHECK(h->csr.scause == EXC_ILLEGAL_INST, "scause = 2");
 
+    printf("\n  Result: %d passed, %d failed\n", trap_pass, trap_fail);
+}
+
+/* ====================== S 态定时器中断自测 (v0.16) ====================== */
+
+void trap_stimer_selftest(void)
+{
+    emulator_t emu;
+    hart_t *h;
+    decoded_inst_t inst;
+    bool ok;
+    u32 v;
+
+    trap_pass = 0;
+    trap_fail = 0;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        Supervisor Timer Self-Test (v0.16)                ║\n");
+    printf("║        STIP / stimecmp (Sstc) / delegation / WFI         ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    /* ---------- 1. stimecmp 到点拉高 STIP ---------- */
+    printf("── stimecmp raises STIP when mtime catches up ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->csr.stimecmp = emu.mtime + 2;
+    put32(&emu, 0x100, 0x00000013u);        /* nop */
+    h->rf.pc = 0x100;
+    emu_step(&emu, &inst);                  /* mtime 0 → 1 */
+    TRAP_CHECK((h->csr.mip & MIP_STIP) == 0,
+               "STIP stays low before mtime reaches stimecmp");
+    h->rf.pc = 0x100;
+    emu_step(&emu, &inst);                  /* mtime 1 → 2 */
+    TRAP_CHECK((h->csr.mip & MIP_STIP) != 0,
+               "STIP rises when mtime reaches stimecmp");
+    TRAP_CHECK((h->csr.sip & MIP_STIP) != 0, "sip.STIP mirrors mip.STIP");
+
+    h->csr.stimecmp = 0;                    /* 关掉定时器 */
+    h->rf.pc = 0x100;
+    emu_step(&emu, &inst);
+    TRAP_CHECK((h->csr.mip & MIP_STIP) == 0, "clearing stimecmp drops STIP");
+
+    /* ---------- 2. 委托给 S 态 ---------- */
+    printf("\n── delegated STIP traps to stvec ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv       = PRIV_S;
+    h->csr.stvec  = 0x500;
+    h->csr.mtvec  = 0x600;
+    h->csr.mideleg = MIP_STIP;
+    h->csr.sie    = MIE_STIE;
+    h->csr.mstatus = MSTATUS_SIE;
+    h->csr.stimecmp = emu.mtime + 1;
+    put32(&emu, 0x40, 0x00000013u);         /* nop */
+    h->rf.pc = 0x40;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->rf.pc == 0x500, "pc = stvec");
+    TRAP_CHECK(h->csr.scause == MCAUSE_IRQ_S_TIMER, "scause = 0x80000005");
+    TRAP_CHECK(h->csr.sepc == 0x40, "sepc = interrupted instruction");
+    TRAP_CHECK(h->priv == PRIV_S, "handler runs in S-mode");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SIE) == 0, "SIE cleared in handler");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_SPIE) != 0, "SPIE saved SIE");
+    TRAP_CHECK((h->csr.sip & MIP_STIP) != 0,
+               "sip.STIP still pending inside the handler");
+
+    /* sret 回原指令; 先撤掉定时器, 否则立刻又进 */
+    h->csr.stimecmp = 0;
+    h->csr.sie = 0;
+    h->csr.sepc = 0x44;
+    put32(&emu, 0x500, 0x10200073u);        /* sret */
+    h->rf.pc = 0x500;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->rf.pc == 0x44 && h->priv == PRIV_S, "sret returns to sepc");
+
+    /* ---------- 3. 没有委托: M 态接管 ---------- */
+    printf("\n── non-delegated STIP is taken in M-mode ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_M;
+    h->csr.mtvec = 0x600;
+    h->csr.mideleg = 0;
+    h->csr.mie = MIE_STIE;
+    h->csr.mstatus = MSTATUS_MIE;
+    h->csr.stimecmp = emu.mtime + 1;
+    put32(&emu, 0x200, 0x00000013u);
+    h->rf.pc = 0x200;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->rf.pc == 0x600, "STIP without mideleg goes to mtvec");
+    TRAP_CHECK(h->csr.mcause == MCAUSE_IRQ_S_TIMER,
+               "mcause = 0x80000005 in M-mode");
+    TRAP_CHECK((h->csr.mstatus & MSTATUS_MPP_MASK) == MSTATUS_MPP_M,
+               "MPP = M");
+
+    /* ---------- 4. 委托出去的 STIP 不打断 M 态 ---------- */
+    printf("\n── delegated STIP does not preempt M-mode ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_M;
+    h->csr.mtvec = 0x600;
+    h->csr.stvec = 0x500;
+    h->csr.mideleg = MIP_STIP;
+    h->csr.sie = MIE_STIE;
+    h->csr.mie = MIE_STIE;
+    h->csr.mstatus = MSTATUS_MIE;
+    h->csr.stimecmp = emu.mtime + 1;
+    put32(&emu, 0x200, 0x00000013u);
+    h->rf.pc = 0x200;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->rf.pc == 0x204, "M-mode keeps executing, pc advances");
+    TRAP_CHECK((h->csr.mip & MIP_STIP) != 0, "STIP stays pending for S-mode");
+
+    /* ---------- 5. M 态软件直接写 mip.STIP ---------- */
+    printf("\n── M-mode software raises mip.STIP ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    csr_write(&h->csr, CSR_MIP, MIP_STIP, &ok);
+    TRAP_CHECK(ok && h->csr.stip_sw == 1 && (h->csr.mip & MIP_STIP) != 0,
+               "writing mip.STIP sets the software source");
+    csr_write(&h->csr, CSR_MIP, 0, &ok);
+    TRAP_CHECK((h->csr.mip & MIP_STIP) == 0, "writing 0 clears it");
+
+    /* S 态只能用 SIP 写 SSIP, STIP 对它是只读的 */
+    h->csr.sip = MIP_STIP;
+    csr_write(&h->csr, CSR_SIP, 0, &ok);
+    TRAP_CHECK((h->csr.sip & MIP_STIP) != 0,
+               "S-mode cannot clear sip.STIP");
+
+    /* ---------- 6. stimecmp / stimecmph 拼成 64 位 ---------- */
+    printf("\n── stimecmp is a 64-bit CSR on RV32 ──\n");
+    h->csr.stimecmp = 0;
+    csr_write(&h->csr, CSR_STIMECMP, 0x11223344u, &ok);
+    csr_write(&h->csr, CSR_STIMECMPH, 0x55667788u, &ok);
+    TRAP_CHECK(h->csr.stimecmp == 0x5566778811223344ULL,
+               "stimecmp/h assemble into one 64-bit value");
+    TRAP_CHECK(csr_read(&h->csr, CSR_STIMECMP, &ok) == 0x11223344u,
+               "reading stimecmp returns the low word");
+    TRAP_CHECK(csr_read(&h->csr, CSR_STIMECMPH, &ok) == 0x55667788u,
+               "reading stimecmph returns the high word");
+
+    /* ---------- 7. WFI 被 STIP 唤醒 ---------- */
+    printf("\n── WFI wakes on STIP ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_S;
+    h->csr.stvec = 0x500;
+    h->csr.mideleg = MIP_STIP;
+    h->csr.sie = MIE_STIE;
+    h->csr.mstatus = 0;                    /* 全局中断关着: 只唤醒, 不立刻进 trap */
+    h->csr.stimecmp = emu.mtime + 3;
+    put32(&emu, 0x300, 0x10500073u);       /* wfi */
+    put32(&emu, 0x304, 0x00000013u);       /* nop */
+    put32(&emu, 0x500, 0x10200073u);       /* sret (用不上) */
+    h->rf.pc = 0x300;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->waiting, "wfi enters the wait state");
+    emu_run(&emu, 8);
+    TRAP_CHECK(!h->waiting, "STIP wakes the hart");
+    TRAP_CHECK((h->csr.mip & MIP_STIP) != 0, "mip.STIP is pending after the wake");
+
+    /* SIE=1 时醒来直接进 S handler */
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_S;
+    h->csr.stvec = 0x500;
+    h->csr.mideleg = MIP_STIP;
+    h->csr.sie = MIE_STIE;
+    h->csr.mstatus = MSTATUS_SIE;
+    h->csr.stimecmp = emu.mtime + 3;
+    put32(&emu, 0x300, 0x10500073u);
+    put32(&emu, 0x304, 0x00000013u);
+    put32(&emu, 0x500, 0x10200073u);
+    h->rf.pc = 0x300;
+    emu_step(&emu, &inst);
+    emu_run(&emu, 8);
+    TRAP_CHECK(h->rf.pc == 0x500, "waking with SIE=1 traps to stvec");
+    TRAP_CHECK(h->csr.scause == MCAUSE_IRQ_S_TIMER, "scause = 0x80000005");
+    TRAP_CHECK(h->csr.sepc == 0x304, "sepc = instruction after wfi");
+
+    /* ---------- 8. 中断优先级: SEI 先于 STI ---------- */
+    printf("\n── supervisor external beats supervisor timer ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h = &emu.harts[0];
+    h->state = EMU_RUNNING;
+    h->priv = PRIV_S;
+    h->csr.stvec = 0x500;
+    h->csr.mideleg = MIP_SEIP | MIP_STIP;
+    h->csr.sie = MIE_SEIE | MIE_STIE;
+    h->csr.mstatus = MSTATUS_SIE;
+    h->csr.stimecmp = emu.mtime + 1;
+    emu.plic.priority[2] = 3;
+    emu.plic.enable[PLIC_CTX_S(0)] = 1u << 2;
+    plic_raise(&emu.plic, 2);
+    put32(&emu, 0x40, 0x00000013u);
+    h->rf.pc = 0x40;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->csr.scause == MCAUSE_IRQ_S_EXT, "SEI is delivered first");
+
+    /*
+     * handler 里 claim + complete 掉 IRQ2 (读 claim 才清 pending),
+     * 再把 SIE 打开 —— 相当于 sret 恢复了中断。下一个边界 STIP 还在,
+     * 这时应该轮到定时器中断。
+     */
+    v = 0;
+    plic_mmio_read(&emu.plic, PLIC_CLAIM(PLIC_CTX_S(0)), &v);
+    plic_mmio_write(&emu.plic, PLIC_CLAIM(PLIC_CTX_S(0)), v);
+    h->csr.mstatus |= MSTATUS_SIE;
+    put32(&emu, 0x500, 0x00000013u);
+    h->rf.pc = 0x500;
+    emu_step(&emu, &inst);
+    TRAP_CHECK(h->csr.scause == MCAUSE_IRQ_S_TIMER,
+               "STI follows once SEI is completed");
+
+    (void)v;
     printf("\n  Result: %d passed, %d failed\n", trap_pass, trap_fail);
 }
