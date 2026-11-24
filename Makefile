@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo level-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo level-demo sb-demo mp-demo
 
 all: $(TARGET)
 
@@ -125,6 +125,20 @@ level-demo: $(TARGET)
 	@mkdir -p $(BUILDDIR)
 	python tests/gen_level_demo.py $(BUILDDIR)/level_demo.elf
 	$(TARGET) $(BUILDDIR)/level_demo.elf
+
+# v0.18 litmus: store buffering (弱模型输出 00, SC 输出 11)
+sb-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_litmus_demo.py sb $(BUILDDIR)/litmus_sb.elf
+	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_sb.elf
+
+# v0.18 litmus: message passing (有 fence 输出 11, 去掉 fence 输出 10)
+mp-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_litmus_demo.py mp $(BUILDDIR)/litmus_mp.elf
+	python tests/gen_litmus_demo.py mp-nofence $(BUILDDIR)/litmus_mp_nofence.elf
+	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_mp.elf
+	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_mp_nofence.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

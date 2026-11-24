@@ -20,12 +20,28 @@
 
 #define ELF_ENTRY_MAX   256   /* 入口地址 (运行时设置) */
 #define MAX_HARTS       4     /* 最多模拟几个核 */
+#define SB_ENTRIES      8     /* 每个 hart 的写缓冲项数 */
 
 typedef enum {
     EMU_RUNNING,
     EMU_HALTED,         /* ebreak / ecall + stop */
     EMU_EXCEPTION,      /* 未处理异常 */
 } emu_state_t;
+
+/**
+ * @brief 写缓冲里的一条未提交 store (v0.18)
+ *
+ * 弱内存模型下, store 先进入本 hart 的写缓冲, 过若干条指令才写进
+ * 共享内存。delay 归零之前, 别的 hart 看不到这个值, 本 hart 自己
+ * 的 load 可以从缓冲里直接转发。
+ */
+typedef struct {
+    u32  addr;          /* 物理地址 */
+    u64  value;         /* 写入值 (最多 8 字节) */
+    u32  size;          /* 1/2/4/8 */
+    u32  delay;         /* 还剩几条指令变成全局可见 */
+    bool valid;
+} sb_entry_t;
 
 /**
  * @brief 一个 hart (硬件线程) 的完整现场
@@ -64,6 +80,9 @@ typedef struct {
      */
     bool        waiting;
 
+    /* v0.18: 写缓冲。SC 模型下始终为空。 */
+    sb_entry_t  sb[SB_ENTRIES];
+
     emu_state_t state;
 } hart_t;
 
@@ -86,6 +105,15 @@ typedef struct {
 
     u32         entry;              /* ELF 入口地址 (所有 hart 相同) */
     u32         exit_code;          /* 最后一个退出 hart 的退出码 */
+
+    /*
+     * v0.18 内存模型:
+     *   weak_mem = false  → 顺序一致 (SC), store 立刻可见
+     *   weak_mem = true   → 每个 hart 一个写缓冲, store 延迟可见
+     * sb_lag 是基础延迟 (条指令), 再叠加按地址计算的 bank 偏斜。
+     */
+    bool        weak_mem;
+    u32         sb_lag;
 } emulator_t;
 
 /** 取当前 hart 的可写现场 */
@@ -129,5 +157,20 @@ void  emu_dump_state(emulator_t *emu);
 
 /* 多 hart 自测 (v0.12) */
 void  emu_selftest(void);
+
+/* --- 写缓冲 / 弱内存模型 (v0.18) --- */
+
+/* 把当前 hart 的写缓冲全部提交到内存 */
+void  hart_sb_flush(emulator_t *emu);
+/* 提交所有 hart 的写缓冲 (原子指令用) */
+void  hart_sb_flush_all(emulator_t *emu);
+/* 每条指令退休后调用: 递减延迟, 到期的写进内存 */
+void  hart_sb_tick(emulator_t *emu);
+/* 经写缓冲的 store / load (大小 1/2/4/8) */
+bool  hart_mem_store(emulator_t *emu, u32 pa, u64 value, u32 size);
+bool  hart_mem_load(emulator_t *emu, u32 pa, u64 *value, u32 size);
+
+/* 写缓冲自测 */
+void  membuf_selftest(void);
 
 #endif /* _RVEMU_EMU_H */

@@ -92,6 +92,7 @@ static inst_fmt_t get_fmt(opcode_t op)
     case OP_AUIPC:  return FMT_U;
     case OP_JAL:    return FMT_J;
     case OP_SYSTEM: return FMT_I;  /* ECALL/CSR */
+    case OP_FENCE:  return FMT_I;  /* v0.18: fence 也有了实际作用 */
     default:        return FMT_UNKNOWN;
     }
 }

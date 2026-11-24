@@ -29,6 +29,8 @@ static void usage(const char *prog)
     printf("  -d, --debug      interactive debugger\n");
     printf("  --steps N        stop after N instructions\n");
     printf("  --harts N        emulate N harts (default 1, max %d)\n", MAX_HARTS);
+    printf("  --mem-model M    sc | weak (default sc)\n");
+    printf("  --sb-lag N       store-buffer visibility lag (default 2)\n");
     printf("  -h, --help       this message\n");
 }
 
@@ -40,6 +42,8 @@ int main(int argc, char *argv[])
     bool selftest = false;
     u64 max_steps = 0;
     u32 nharts = 1;
+    bool weak_mem = false;
+    u32 sb_lag = 2;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -55,6 +59,22 @@ int main(int argc, char *argv[])
                 printf("bad hart count %u (1..%u)\n", nharts, MAX_HARTS);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--mem-model") == 0 && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (strcmp(m, "weak") == 0) {
+                weak_mem = true;
+            } else if (strcmp(m, "sc") == 0) {
+                weak_mem = false;
+            } else {
+                printf("bad mem-model %s (sc|weak)\n", m);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--sb-lag") == 0 && i + 1 < argc) {
+            sb_lag = (u32)strtoul(argv[++i], NULL, 0);
+            if (sb_lag > 16) {
+                printf("sb-lag must be <= 16\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -68,16 +88,19 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.17                │\n");
+    printf("│  RV32I Emulator v0.18                │\n");
     printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
     printf("│  + CLINT timer / software IRQ (IPI)  │\n");
     printf("│  + PLIC external interrupts (M+S)    │\n");
     printf("│  + Sstc supervisor timer (STIP)      │\n");
     printf("│  + level devices / complete re-raise │\n");
+    printf("│  + store buffer / weak memory model  │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
     emu_init_harts(&emu, nharts);
+    emu.weak_mem = weak_mem;    /* v0.18: 必须在 harts 复位之后设置 */
+    emu.sb_lag   = sb_lag;
 
     if (selftest) {
         decode_selftest();
@@ -92,6 +115,7 @@ int main(int argc, char *argv[])
         trap_stimer_selftest();
         mmu_selftest();
         fpu_selftest();
+        membuf_selftest();
         emu_free(&emu);
         return 0;
     }

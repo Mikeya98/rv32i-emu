@@ -36,6 +36,7 @@ static void hart_reset(hart_t *h, u32 hartid)
     h->mtimecmp          = 0;               /* 0 = 定时器关闭 */
     h->msip              = 0;               /* v0.13: 复位时没有软件中断 */
     h->waiting           = false;           /* v0.15: 复位后不在 WFI */
+    memset(h->sb, 0, sizeof(h->sb));        /* v0.18: 写缓冲为空 */
     h->state             = EMU_HALTED;
 }
 
@@ -73,6 +74,10 @@ void emu_init(emulator_t *emu, u32 mem_size)
     emu->mtime     = 0;
     emu->entry     = 0;
     emu->exit_code = 0;
+
+    /* v0.18: 默认 SC, 写缓冲基础延迟 2 条指令 */
+    emu->weak_mem  = false;
+    emu->sb_lag    = 2;
 
     emu_init_harts(emu, 1);
 }
@@ -269,6 +274,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
      * 顺便把全机器共享的 mtime 往前推一格。
      */
     if (trap_check_interrupt(emu, pc)) {
+        hart_sb_flush(emu);     /* v0.18: 进 trap 前提交本 hart 的写 */
         h->csr.mcycle++;
         return true;            /* 这一"步"没有执行指令, 但跳进了 handler */
     }
@@ -382,7 +388,10 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         return false;
     }
 
-    /* 4. 周期计数 */
+    /* 4. 写缓冲老化: 这条指令退休后, 延迟减一 (v0.18) */
+    hart_sb_tick(emu);
+
+    /* 5. 周期计数 */
     h->csr.mcycle++;
 
     return true;

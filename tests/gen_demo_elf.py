@@ -209,6 +209,14 @@ class Assembler:
                 out += struct.pack("<I", b_type(off, rs2, rs1, 4))
                 addr += 4
 
+            elif mn == "nop":
+                out += struct.pack("<I", i_type(0, 0, 0, 0))
+                addr += 4
+
+            elif mn == "fence":         # fence rw, rw
+                out += struct.pack("<I", 0x0FF0000F)
+                addr += 4
+
             elif mn == "mret":
                 out += struct.pack("<I", 0x30200073)
                 addr += 4

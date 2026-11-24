@@ -78,6 +78,181 @@ static void bus_write(emulator_t *emu, u32 pa)
     }
 }
 
+/* ===================== v0.18 写缓冲 / 弱内存模型 =====================
+
+   这个模型只做一件事: 让 store 不立刻可见.
+
+   SC 模型下 store 直接写内存, 和以前完全一样。弱模型下 store 先进入
+   当前 hart 的写缓冲, delay 条指令之后才提交。delay 由两部分组成:
+
+       sb_lag + (pa >> 2) % 5
+
+   第二项是 "bank 偏斜" —— 真实 CPU 里不同 cache line / 内存银行的
+   提交时间并不一致, 这里用一个地址的确定性函数近似, 好让 demo 每次
+   跑出同样的结果。写同一个地址会复用同一项 (覆盖旧值并重置延迟),
+   保证单 hart 的写-写顺序。
+
+   读路径: 本 hart 的 load 先查自己的写缓冲 (store-to-load forwarding),
+   查不到再读内存。别的 hart 只能看到已经提交的写。
+
+   边界:
+     - 只做整宽匹配转发 (同地址同宽度), 不同宽度的部分重叠不转发
+     - fence / trap / 原子指令会把写缓冲强制刷掉
+     - 只模拟 "写延迟 + 银行乱序", 没有 load 重排, 所以比 RVWMO 保守
+   ==================================================================== */
+
+/* 不同地址的提交延迟不同: 0..15 条指令 (16 个银行) */
+static u32 sb_bank_skew(u32 pa)
+{
+    return (pa >> 2) % 16u;
+}
+
+static bool mem_write_size(emulator_t *emu, u32 pa, u64 value, u32 size)
+{
+    switch (size) {
+    case 1: return memory_write8 (&emu->mem, pa, (u8)(value & 0xFFu));
+    case 2: return memory_write16(&emu->mem, pa, (u16)(value & 0xFFFFu));
+    case 4: return memory_write32(&emu->mem, pa, (u32)value);
+    case 8: return memory_write64(&emu->mem, pa, value);
+    default: return false;
+    }
+}
+
+static bool mem_read_size(emulator_t *emu, u32 pa, u64 *value, u32 size)
+{
+    u8  b8;
+    u16 b16;
+    u32 b32;
+
+    switch (size) {
+    case 1:
+        if (!memory_read8(&emu->mem, pa, &b8)) return false;
+        *value = b8;
+        return true;
+    case 2:
+        if (!memory_read16(&emu->mem, pa, &b16)) return false;
+        *value = b16;
+        return true;
+    case 4:
+        if (!memory_read32(&emu->mem, pa, &b32)) return false;
+        *value = b32;
+        return true;
+    case 8:
+        return memory_read64(&emu->mem, pa, value);
+    default:
+        return false;
+    }
+}
+
+/* 把一项写进内存, 并让别的 hart 的 LR 保留失效 */
+static bool sb_commit(emulator_t *emu, sb_entry_t *e)
+{
+    bool ok = mem_write_size(emu, e->addr, e->value, e->size);
+    e->valid = false;
+    if (ok) bus_write(emu, e->addr);
+    return ok;
+}
+
+void hart_sb_flush(emulator_t *emu)
+{
+    hart_t *h = emu_hart(emu);
+    int i;
+
+    for (i = 0; i < SB_ENTRIES; i++) {
+        if (h->sb[i].valid) sb_commit(emu, &h->sb[i]);
+    }
+}
+
+void hart_sb_flush_all(emulator_t *emu)
+{
+    u32 i;
+    int j;
+
+    for (i = 0; i < emu->nharts; i++) {
+        for (j = 0; j < SB_ENTRIES; j++) {
+            if (emu->harts[i].sb[j].valid) {
+                sb_commit(emu, &emu->harts[i].sb[j]);
+            }
+        }
+    }
+}
+
+void hart_sb_tick(emulator_t *emu)
+{
+    hart_t *h = emu_hart(emu);
+    int i;
+
+    if (!emu->weak_mem) return;
+
+    for (i = 0; i < SB_ENTRIES; i++) {
+        if (!h->sb[i].valid) continue;
+        if (h->sb[i].delay > 0) h->sb[i].delay--;
+        if (h->sb[i].delay == 0) sb_commit(emu, &h->sb[i]);
+    }
+}
+
+bool hart_mem_store(emulator_t *emu, u32 pa, u64 value, u32 size)
+{
+    hart_t *h = emu_hart(emu);
+    int i, slot = -1;
+
+    /* SC 模型、MMIO、越界地址: 直接写 */
+    if (!emu->weak_mem || pa + size > emu->mem.size) {
+        bool ok = mem_write_size(emu, pa, value, size);
+        if (ok) bus_write(emu, pa);
+        return ok;
+    }
+
+    /* 已经有一项写同一地址同一宽度 → 覆盖, 重置延迟 */
+    for (i = 0; i < SB_ENTRIES; i++) {
+        if (h->sb[i].valid && h->sb[i].addr == pa &&
+            h->sb[i].size == size) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        for (i = 0; i < SB_ENTRIES; i++) {
+            if (!h->sb[i].valid) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot < 0) {
+        /* 缓冲满: 提交最早到期的一项, 腾出位置 */
+        slot = 0;
+        for (i = 1; i < SB_ENTRIES; i++) {
+            if (h->sb[i].delay < h->sb[slot].delay) slot = i;
+        }
+        sb_commit(emu, &h->sb[slot]);
+    }
+
+    h->sb[slot].addr  = pa;
+    h->sb[slot].value = value;
+    h->sb[slot].size  = size;
+    h->sb[slot].delay = emu->sb_lag + sb_bank_skew(pa);
+    h->sb[slot].valid = true;
+    return true;
+}
+
+bool hart_mem_load(emulator_t *emu, u32 pa, u64 *value, u32 size)
+{
+    hart_t *h = emu_hart(emu);
+    int i;
+
+    if (emu->weak_mem) {
+        for (i = SB_ENTRIES - 1; i >= 0; i--) {
+            if (h->sb[i].valid && h->sb[i].addr == pa &&
+                h->sb[i].size == size) {
+                *value = h->sb[i].value;
+                return true;
+            }
+        }
+    }
+    return mem_read_size(emu, pa, value, size);
+}
+
 /* =========================== 核心 =========================== */
 
 bool execute(emulator_t *emu, decoded_inst_t *inst)
@@ -92,9 +267,8 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
     u32 addr = 0;
     u32 pa   = 0;
     int  xrc;
-    u8  b8;
-    u16 b16;
     u32 b32;
+    u64 lv;
     bool ok;
     u32 fault_cause = EXC_LOAD_ACCESS;   /* goto except 时带上的异常码 */
 
@@ -278,24 +452,24 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
         switch (inst->funct3) {
         case F3_LB:   /* LB:  byte, sign-extend */
-            if (!memory_read8(&emu->mem, pa, &b8))  goto except;
-            result = sext8(b8);
+            if (!hart_mem_load(emu, pa, &lv, 1)) goto except;
+            result = sext8((u32)lv);
             break;
         case F3_LH:   /* LH:  halfword, sign-extend */
-            if (!memory_read16(&emu->mem, pa, &b16)) goto except;
-            result = sext16(b16);
+            if (!hart_mem_load(emu, pa, &lv, 2)) goto except;
+            result = sext16((u32)lv);
             break;
         case F3_LW:   /* LW:  word */
-            if (!memory_read32(&emu->mem, pa, &b32)) goto except;
-            result = b32;
+            if (!hart_mem_load(emu, pa, &lv, 4)) goto except;
+            result = (u32)lv;
             break;
         case F3_LBU:  /* LBU: byte, zero-extend */
-            if (!memory_read8(&emu->mem, pa, &b8))  goto except;
-            result = b8;
+            if (!hart_mem_load(emu, pa, &lv, 1)) goto except;
+            result = (u32)lv & 0xFFu;
             break;
         case F3_LHU:  /* LHU: halfword, zero-extend */
-            if (!memory_read16(&emu->mem, pa, &b16)) goto except;
-            result = b16;
+            if (!hart_mem_load(emu, pa, &lv, 2)) goto except;
+            result = (u32)lv & 0xFFFFu;
             break;
         default:
             goto unknown;
@@ -322,11 +496,11 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_read32(&emu->mem, pa, &b32)) {
+            if (!hart_mem_load(emu, pa, &lv, 4)) {
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
-            h->rf.fregs[inst->rd] = fp32_box(b32);
+            h->rf.fregs[inst->rd] = fp32_box((u32)lv);
             csr_fpu_dirty(&h->csr);
             break;
         }
@@ -341,7 +515,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_read64(&emu->mem, pa, &h->rf.fregs[inst->rd])) {
+            if (!hart_mem_load(emu, pa, &h->rf.fregs[inst->rd], 8)) {
                 fault_cause = EXC_LOAD_ACCESS;
                 goto except;
             }
@@ -431,13 +605,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
         switch (inst->funct3) {
         case F3_SB:   /* SB: store byte */
-            ok = memory_write8(&emu->mem, pa, (u8)(rs2_val & 0xFF));
+            ok = hart_mem_store(emu, pa, rs2_val & 0xFFu, 1);
             break;
         case F3_SH:   /* SH: store halfword */
-            ok = memory_write16(&emu->mem, pa, (u16)(rs2_val & 0xFFFF));
+            ok = hart_mem_store(emu, pa, rs2_val & 0xFFFFu, 2);
             break;
         case F3_SW:   /* SW: store word */
-            ok = memory_write32(&emu->mem, pa, rs2_val);
+            ok = hart_mem_store(emu, pa, rs2_val, 4);
             break;
         default:
             goto unknown;
@@ -446,8 +620,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             fault_cause = EXC_STORE_ACCESS;
             goto except;
         }
-        /* 普通 store 命中任一 hart 的 LR 保留地址 → 保留失效 */
-        bus_write(emu, pa);
+        /* 写缓冲提交时会通知 LR 保留失效 (SC 模型下就是现在) */
         break;
 
     /* ===================== FSW / FSD (v0.8 / v0.9) ===================== */
@@ -468,12 +641,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_write32(&emu->mem, pa,
-                                (u32)h->rf.fregs[inst->rs2])) {
+            if (!hart_mem_store(emu, pa, (u32)h->rf.fregs[inst->rs2], 4)) {
                 fault_cause = EXC_STORE_ACCESS;
                 goto except;
             }
-            bus_write(emu, pa);
             csr_fpu_dirty(&h->csr);
             break;
         }
@@ -488,11 +659,10 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                 fault_cause = xrc;
                 goto except;
             }
-            if (!memory_write64(&emu->mem, pa, h->rf.fregs[inst->rs2])) {
+            if (!hart_mem_store(emu, pa, h->rf.fregs[inst->rs2], 8)) {
                 fault_cause = EXC_STORE_ACCESS;
                 goto except;
             }
-            bus_write(emu, pa);
             csr_fpu_dirty(&h->csr);
             break;
         }
@@ -534,6 +704,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         if (inst->funct3 != 2) {        /* 只实现 .W */
             goto unknown;
         }
+
+        /*
+         * v0.18: 原子操作必须看到全局最新的值, 所以先把所有 hart 的
+         * 写缓冲刷掉。真实硬件用总线锁/缓存一致性协议达到同样的效果,
+         * 这里是显式的、保守的实现。
+         */
+        hart_sb_flush_all(emu);
 
         addr = rs1_val;
         if (addr & 3u) {
@@ -661,6 +838,13 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== SYSTEM ===================== */
     case OP_SYSTEM:
+        /*
+         * v0.18: 进出 trap 时把本 hart 的写缓冲刷掉。真实硬件不保证
+         * trap 会清写缓冲, 但模拟器里的 ecall/write 要读刚写过的
+         * 字符串, 不刷会读到旧值 —— 这里选一个对上层透明的约定:
+         * trap 边界 = 本 hart 的写全部提交。
+         */
+        hart_sb_flush(emu);
         /*
          * ecall / ebreak / mret 的 funct3 都是 0, 不能用 funct3 区分,
          * 必须按整条指令的值判断。早期只有 ecall 时按 funct3 判断没问题,
@@ -899,14 +1083,14 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
     /* ===================== FENCE ===================== */
     /*
-     * v0.12: 多 hart 之后 fence 仍然不需要做任何事。
+     * v0.18: 弱内存模型下 fence 有实际作用 —— 把本 hart 写缓冲里的
+     * store 全部提交, 让 fence 之前的写对别的 hart 可见, 才能保证
+     * fence 之后的写不会抢先出现。
      *
-     * 真实 CPU 会重排访存, fence 用来约束顺序; 这个模拟器里
-     * 所有 hart 是串行轮转执行的, 每条访存都立刻生效, 内存模型
-     * 等价于顺序一致 (SC) —— 比 RVWMO 强, 任何 fence 都不会再
-     * 改变可见性。保留这条指令的合法性检查即可。
+     * SC 模型下写缓冲永远是空的, 这条指令仍然是空操作。
      */
     case OP_FENCE:
+        hart_sb_flush(emu);
         break;
 
     default:
@@ -1383,6 +1567,171 @@ void execute_selftest(void)
     printf("\n╔══════════════════════════════════════════════════════════╗\n");
     printf("║  Execute Self-Test: %d passed, %d failed%*s║\n",
            pass, fail, (int)(36 - snprintf(NULL, 0, "%d", pass) - snprintf(NULL, 0, "%d", fail) - 40), "");
+    printf("╚══════════════════════════════════════════════════════════╝\n");
+}
+
+/* ===================== v0.18 写缓冲自测 ===================== */
+
+void membuf_selftest(void)
+{
+    emulator_t emu;
+    hart_t *h1;
+    u64 v;
+    int pass = 0, fail = 0;
+    int i;
+    const u32 A = 0x001004;     /* skew = (A>>2)%16 = 1 */
+    const u32 B = 0x001008;
+
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════╗\n");
+    printf("║        Store Buffer / Weak Memory Self-Test              ║\n");
+    printf("╚══════════════════════════════════════════════════════════╝\n\n");
+
+    emu_init(&emu, MEM_SIZE);
+    emu_init_harts(&emu, 2);
+    h1 = &emu.harts[1];
+
+    /* ---------- SC: 立刻可见 ---------- */
+    printf("── SC model ──\n");
+    emu.cur = 0;
+    CHECK(hart_mem_store(&emu, A, 0x11223344, 4), "SC: store accepted");
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0x11223344,
+          "SC: other hart sees the store immediately");
+    emu.cur = 0;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0x11223344,
+          "SC: own load sees the store");
+
+    /* ---------- 弱模型: 延迟可见 ---------- */
+    printf("── weak model: delayed visibility ──\n");
+    emu.weak_mem = true;
+    emu.sb_lag   = 2;
+    emu.cur = 0;
+    hart_mem_store(&emu, A, 0xAABBCCDD, 4);
+    emu.cur = 0;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0xAABBCCDD,
+          "weak: own load forwards from the buffer");
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0x11223344,
+          "weak: other hart still sees the old value");
+
+    /* 让 h0 的缓冲老化: A 的延迟 = 2 + (A>>2)%16 = 2 + 1 = 3 */
+    emu.cur = 0;
+    hart_sb_tick(&emu);
+    hart_sb_tick(&emu);
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0x11223344,
+          "weak: still pending after 2 ticks");
+    emu.cur = 0;
+    for (i = 0; i < 2; i++) hart_sb_tick(&emu);
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, A, &v, 4) && v == 0xAABBCCDD,
+          "weak: visible after lag");
+
+    /* ---------- 同地址覆盖 ---------- */
+    printf("── same-address overwrite ──\n");
+    emu.cur = 0;
+    hart_mem_store(&emu, B, 0x01, 4);
+    hart_mem_store(&emu, B, 0x02, 4);
+    hart_mem_load(&emu, B, &v, 4);
+    CHECK(v == 0x02, "weak: last store wins in the buffer");
+    hart_sb_flush(&emu);
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, B, &v, 4) && v == 0x02,
+          "weak: flush commits the latest value");
+
+    /* ---------- fence 提交 ---------- */
+    printf("── fence / flush ──\n");
+    emu.cur = 0;
+    hart_mem_store(&emu, B, 0xDEADBEEF, 4);
+    emu.cur = 1;
+    hart_mem_load(&emu, B, &v, 4);
+    CHECK(v == 0x02, "weak: new store not visible before fence");
+    emu.cur = 0;
+    hart_sb_flush(&emu);        /* OP_FENCE 做的就是这件事 */
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, B, &v, 4) && v == 0xDEADBEEF,
+          "weak: fence publishes the store");
+
+    /* ---------- 宽度 ---------- */
+    printf("── sizes ──\n");
+    emu.cur = 0;
+    hart_mem_store(&emu, A + 0x20, 0xAB, 1);
+    hart_mem_store(&emu, A + 0x22, 0x1234, 2);
+    hart_mem_store(&emu, A + 0x28, 0x0123456789ABCDEFULL, 8);
+    CHECK(hart_mem_load(&emu, A + 0x20, &v, 1) && v == 0xAB, "byte forward");
+    CHECK(hart_mem_load(&emu, A + 0x22, &v, 2) && v == 0x1234, "halfword forward");
+    CHECK(hart_mem_load(&emu, A + 0x28, &v, 8) &&
+          v == 0x0123456789ABCDEFULL, "doubleword forward");
+    hart_sb_flush(&emu);
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, A + 0x28, &v, 8) &&
+          v == 0x0123456789ABCDEFULL, "doubleword committed");
+
+    /* ---------- LR 保留在提交时才失效 ---------- */
+    printf("── LR/SC interaction ──\n");
+    h1->reservation_valid = 1;
+    h1->reservation_addr  = A;
+    emu.cur = 0;
+    hart_mem_store(&emu, A, 0xCAFEBABE, 4);
+    CHECK(h1->reservation_valid == 1,
+          "weak: buffered store does not kill the reservation yet");
+    hart_sb_flush(&emu);
+    CHECK(h1->reservation_valid == 0,
+          "weak: commit invalidates the reservation");
+
+    /* ---------- 缓冲满: 不丢数据 ---------- */
+    printf("── buffer full ──\n");
+    emu.cur = 0;
+    for (i = 0; i < SB_ENTRIES + 2; i++) {
+        hart_mem_store(&emu, 0x002000 + (u32)i * 4, (u64)(0x100 + i), 4);
+    }
+    hart_sb_flush(&emu);
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, 0x002000, &v, 4) && v == 0x100,
+          "oldest entry survives eviction");
+    CHECK(hart_mem_load(&emu, 0x002000 + (SB_ENTRIES + 1) * 4, &v, 4) &&
+          v == 0x100 + SB_ENTRIES + 1,
+          "newest entry is in memory");
+
+    /* ---------- store buffering litmus: SB ---------- */
+    printf("── litmus: store buffering ──\n");
+    {
+        u32 x = 0x00303C, y = 0x003038;     /* 两个地址都落在慢银行 */
+        u32 r0, r1;
+
+        /* SC: 两个 store 立刻可见, 两个 load 都读到 1 */
+        emu.weak_mem = false;
+        emu.cur = 0; hart_mem_store(&emu, x, 1, 4);
+        emu.cur = 1; hart_mem_store(&emu, y, 1, 4);
+        emu.cur = 0; hart_mem_load(&emu, y, &v, 4); r0 = (u32)v;
+        emu.cur = 1; hart_mem_load(&emu, x, &v, 4); r1 = (u32)v;
+        CHECK(r0 == 1 && r1 == 1, "SC: SB outcome is (1,1)");
+
+        /* 弱模型: store 还在缓冲里, 两个 load 都读到 0 */
+        memory_write32(&emu.mem, x, 0);
+        memory_write32(&emu.mem, y, 0);
+        emu.weak_mem = true;
+        emu.cur = 0;
+        hart_mem_store(&emu, x, 1, 4);
+        hart_sb_tick(&emu);
+        emu.cur = 1;
+        hart_mem_store(&emu, y, 1, 4);
+        hart_sb_tick(&emu);
+        emu.cur = 0;
+        hart_mem_load(&emu, y, &v, 4); r0 = (u32)v;
+        hart_sb_tick(&emu);
+        emu.cur = 1;
+        hart_mem_load(&emu, x, &v, 4); r1 = (u32)v;
+        hart_sb_tick(&emu);
+        CHECK(r0 == 0 && r1 == 0, "weak: SB outcome is (0,0)");
+    }
+
+    emu_free(&emu);
+
+    printf("\n╔══════════════════════════════════════════════════════════╗\n");
+    printf("║  Store Buffer Self-Test: %d passed, %d failed            ║\n",
+           pass, fail);
     printf("╚══════════════════════════════════════════════════════════╝\n");
 }
 

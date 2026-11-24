@@ -34,8 +34,9 @@
 - **S 态 PLIC 上下文 + WFI（v0.15）** — 每个 hart 有 M/S 两个 PLIC 上下文（M = 2h、S = 2h+1，和 QEMU virt 一致）：M 上下文拉 `mip.MEIP`，S 上下文拉 `mip.SEIP`/`sip.SEIP`。`mideleg[9] = 1` 时 S 外部中断直接进 `stvec`（`scause = 0x80000009`），claim/complete 也走 S 上下文；没委托时由 M 态用 `mie.SEIE` 接管。`wfi` 在没有已使能中断时真的停下来（`hart->waiting`），中断到来后恢复；所有核都在 WFI 且没有定时器/外部源时判定死锁并停机，有 `mtimecmp` 则直接把 `mtime` 快进到最近的一次到期
 - **S 态定时器中断（v0.16）** — 实现 Sstc 的 `stimecmp`/`stimecmph`（64 位比较值，RV32 拆两个 CSR）：`mtime` 追平比较值就把 `mip.STIP`/`sip.STIP` 拉成电平。`mideleg[5] = 1` 时 S 定时器中断直接进 `stvec`（`scause = 0x80000005`），否则由 M 态用 `mie.STIE` 接管；M 态软件也可以直接写 `mip.STIP` 转发。委托出去的中断不打断 M 态，`sip.STIP` 对 S 态只读，WFI 的唤醒条件和死锁快进都算上了 `stimecmp`
 - **电平设备与 complete 重报（v0.17）** — 设备可以按电平方式拉线（`plic_set_level` / 电平寄存器），线一直为高时 claim 先清 pending，`complete` 时网关重新放行、pending 再次置起，中断会重复投递到 handler。驱动必须在 complete 之前把设备的中断清掉，顺序反了就是中断风暴。边沿设备（门铃）没有线电平，complete 后不会重报
+- **写缓冲与弱内存模型（v0.18）** — 每个 hart 一个 8 项写缓冲，`--mem-model weak` 时 store 先入缓冲、`sb_lag + (addr>>2)%16` 条指令后才写进共享内存；本 hart 的 load 从写缓冲转发（store-to-load forwarding），别的 hart 只能看到已提交的写。`fence` 把缓冲刷干净，原子指令/trap 边界也会强制提交。`--mem-model sc` 保持原来的顺序一致。两个 litmus test：store buffering 在 SC 下是 `11`、弱模型下是 `00`；message passing 有 `fence` 是 `11`、去掉 fence 是 `10`
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项，共 472 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项 + 写缓冲 21 项，共 493 项，`make test` 全过
 
 ## 快速开始
 
@@ -92,6 +93,16 @@ make stip-demo
 
 # 电平设备 demo：complete 后线还高 → 重报，第 3 次清线后停下，打印 L123
 make level-demo
+
+# 写缓冲 litmus：SB 弱模型打印 00（SC 模式是 11）
+make sb-demo
+
+# message passing litmus：有 fence 打印 11，去掉 fence 打印 10
+make mp-demo
+
+# 也可以手动选内存模型跑同一个程序
+./build/rvemu --harts 2 --mem-model sc   build/litmus_sb.elf
+./build/rvemu --harts 2 --mem-model weak build/litmus_sb.elf
 
 # 在调试器里打开同一个程序
 make debug-demo
