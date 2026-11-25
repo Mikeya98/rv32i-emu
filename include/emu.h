@@ -43,6 +43,28 @@ typedef struct {
     bool valid;
 } sb_entry_t;
 
+#define LB_ENTRIES 4
+
+/**
+ * @brief 读缓冲里的一条未完成 load (v0.19)
+ *
+ * 弱模型下 load 可以先发射、过若干条指令再把值写回寄存器。写回之前
+ * 目标寄存器处于 "pending" 状态, 谁要读它就得等 (记分牌停等)。
+ * 在等待期间, 同一个 hart 后面的 store 可以照常执行并提交 —— 这就是
+ * load buffering: load 的结果可以在比自己晚的 store 之后才落定。
+ *
+ * 值不在发射时采样, 而是在提交时读内存, 因此能看到这中间别的 hart
+ * 提交的 store。
+ */
+typedef struct {
+    u32  addr;          /* 物理地址 */
+    u32  rd;            /* 目标整数寄存器 */
+    u32  size;          /* 1/2/4 */
+    u32  delay;         /* 还有几条指令写回 */
+    bool sign;          /* 有符号扩展 (LB/LH) */
+    bool valid;
+} lb_entry_t;
+
 /**
  * @brief 一个 hart (硬件线程) 的完整现场
  *
@@ -83,6 +105,10 @@ typedef struct {
     /* v0.18: 写缓冲。SC 模型下始终为空。 */
     sb_entry_t  sb[SB_ENTRIES];
 
+    /* v0.19: 读缓冲 + 记分牌。lb_pending 的 bit n = 寄存器 n 还在等值。 */
+    lb_entry_t  lb[LB_ENTRIES];
+    u32         lb_pending;
+
     emu_state_t state;
 } hart_t;
 
@@ -114,6 +140,14 @@ typedef struct {
      */
     bool        weak_mem;
     u32         sb_lag;
+
+    /*
+     * v0.19 load buffering:
+     *   lb_lag = 0  → load 立即完成 (和 v0.18 一样)
+     *   lb_lag > 0  → load 延迟 lb_lag + bank 偏斜 条指令写回
+     * 两种延迟分开配置, 因为 store 和 load 走的是不同的队列。
+     */
+    u32         lb_lag;
 } emulator_t;
 
 /** 取当前 hart 的可写现场 */
@@ -169,6 +203,12 @@ void  hart_sb_tick(emulator_t *emu);
 /* 经写缓冲的 store / load (大小 1/2/4/8) */
 bool  hart_mem_store(emulator_t *emu, u32 pa, u64 value, u32 size);
 bool  hart_mem_load(emulator_t *emu, u32 pa, u64 *value, u32 size);
+
+/* v0.19: 读缓冲 / load buffering */
+bool  hart_lb_enqueue(emulator_t *emu, u32 rd, u32 pa, u32 size, bool sign);
+void  hart_lb_tick(emulator_t *emu);
+void  hart_lb_drain(emulator_t *emu);
+bool  hart_lb_pending(const emulator_t *emu);
 
 /* 写缓冲自测 */
 void  membuf_selftest(void);

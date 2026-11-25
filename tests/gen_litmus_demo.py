@@ -14,15 +14,27 @@
          有 fence 时 r 一定是 1。把 fence 去掉，x 和 y 落在不同的
          内存银行，y 先提交、x 后提交，P1 就会读到 y=1, x=0。
 
+    lb:  load buffering (v0.19)
+         P0:  r0 = x ; y = 1
+         P1:  r1 = y ; x = 1
+         顺序一致下两个 load 都在对方 store 之前完成, 读回 0,0。
+         打开 load 缓冲之后, load 的结果拖到对方 store 提交之后才
+         写回, 两个 load 都能读到 1, 得到 1,1 —— 这个结果在 SC 下
+         是非法的 (会形成 Lx<Sy<Ly<Sx<Lx 的环)。
+
 用法:
     python tests/gen_litmus_demo.py sb build/sb.elf
     python tests/gen_litmus_demo.py mp build/mp.elf
     python tests/gen_litmus_demo.py mp-nofence build/mp_nofence.elf
+    python tests/gen_litmus_demo.py lb build/lb.elf
 
     build/rvemu --harts 2 --mem-model sc   build/sb.elf   → 11
     build/rvemu --harts 2 --mem-model weak build/sb.elf   → 00
     build/rvemu --harts 2 --mem-model weak build/mp.elf   → 11
     build/rvemu --harts 2 --mem-model weak build/mp_nofence.elf → 10
+    build/rvemu --harts 2 --mem-model sc   build/lb.elf   → 00
+    build/rvemu --harts 2 --mem-model weak build/lb.elf   → 00  (lb-lag=0)
+    build/rvemu --harts 2 --mem-model weak --lb-lag 16 build/lb.elf → 11
 
 关键点:
   - 两个 hart 从同一入口启动，用 mhartid 分流
@@ -43,6 +55,8 @@ MISA_MHARTID = 0xF14
 X = 0x1403C          # skew 15，提交最慢（MP 里的 x）
 Y = 0x14000          # skew 0，提交最快（MP 里的 y）
 Y_SB = 0x14038       # skew 14，SB 里两个地址都要慢才能读到 0
+X_LB = 0x14000       # LB: store 要快 (skew 0)
+Y_LB = 0x14004       #     load 慢由 --lb-lag 负责 (skew 1)
 
 
 def mhartid(asm, rd):
@@ -132,6 +146,38 @@ def build_mp(use_fence):
     return code, labels["_start"]
 
 
+def build_lb():
+    """load buffering: 每个 hart 先 load 再 store 另一个地址"""
+    asm = Assembler()
+    asm.label("_start")
+    mhartid(asm, "t0")
+    asm.emit("bnez", "t0", "p1")
+
+    # ---- P0: r0 = x; y = 1 ----
+    asm.emit("li32", "t2", X_LB)
+    asm.emit("lw", "t4", "t2", 0)
+    asm.emit("li", "t1", 1)
+    asm.emit("li32", "t3", Y_LB)
+    asm.emit("sw", "t1", "t3", 0)
+    asm.emit("addi", "t4", "t4", 48)        # '0' + r0, 依赖 load 写回
+    print_char(asm, "t4")
+    exit0(asm)
+
+    # ---- P1: r1 = y; x = 1 ----
+    asm.label("p1")
+    asm.emit("li32", "t2", Y_LB)
+    asm.emit("lw", "t4", "t2", 0)
+    asm.emit("li", "t1", 1)
+    asm.emit("li32", "t3", X_LB)
+    asm.emit("sw", "t1", "t3", 0)
+    asm.emit("addi", "t4", "t4", 48)
+    print_char(asm, "t4")
+    exit0(asm)
+
+    code, labels = asm.assemble(BASE)
+    return code, labels["_start"]
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -144,6 +190,8 @@ def main():
         code, entry = build_mp(True)
     elif kind == "mp-nofence":
         code, entry = build_mp(False)
+    elif kind == "lb":
+        code, entry = build_lb()
     else:
         print(f"unknown kind: {kind}")
         return 1

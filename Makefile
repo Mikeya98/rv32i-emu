@@ -17,7 +17,7 @@ DEPS     = $(OBJS:.o=.d)
 # 会按旧偏移读写 (改 regfile_t 时踩过, 表现为 f 寄存器全是 0)
 -include $(DEPS)
 
-.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo level-demo sb-demo mp-demo
+.PHONY: all clean run test demo debug-demo trap-demo sv32-demo s-demo atomic-demo rvc-demo f-demo d-demo fs-demo multihart-demo ipi-demo plic-demo plic-s-demo stip-demo level-demo sb-demo mp-demo lb-demo
 
 all: $(TARGET)
 
@@ -139,6 +139,15 @@ mp-demo: $(TARGET)
 	python tests/gen_litmus_demo.py mp-nofence $(BUILDDIR)/litmus_mp_nofence.elf
 	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_mp.elf
 	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_mp_nofence.elf
+
+# v0.19 litmus: load buffering
+#   SC → 00, 弱模型默认 (无 load 缓冲) → 00, --lb-lag 16 → 11
+lb-demo: $(TARGET)
+	@mkdir -p $(BUILDDIR)
+	python tests/gen_litmus_demo.py lb $(BUILDDIR)/litmus_lb.elf
+	$(TARGET) --harts 2 --mem-model sc $(BUILDDIR)/litmus_lb.elf
+	$(TARGET) --harts 2 --mem-model weak $(BUILDDIR)/litmus_lb.elf
+	$(TARGET) --harts 2 --mem-model weak --lb-lag 16 $(BUILDDIR)/litmus_lb.elf
 
 # 在调试器里打开同一个 demo
 debug-demo: $(TARGET)

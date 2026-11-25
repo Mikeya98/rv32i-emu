@@ -37,6 +37,8 @@ static void hart_reset(hart_t *h, u32 hartid)
     h->msip              = 0;               /* v0.13: 复位时没有软件中断 */
     h->waiting           = false;           /* v0.15: 复位后不在 WFI */
     memset(h->sb, 0, sizeof(h->sb));        /* v0.18: 写缓冲为空 */
+    memset(h->lb, 0, sizeof(h->lb));        /* v0.19: 读缓冲为空 */
+    h->lb_pending        = 0;
     h->state             = EMU_HALTED;
 }
 
@@ -78,6 +80,7 @@ void emu_init(emulator_t *emu, u32 mem_size)
     /* v0.18: 默认 SC, 写缓冲基础延迟 2 条指令 */
     emu->weak_mem  = false;
     emu->sb_lag    = 2;
+    emu->lb_lag    = 0;         /* v0.19: 默认不模拟 load buffering */
 
     emu_init_harts(emu, 1);
 }
@@ -275,12 +278,14 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
      */
     if (trap_check_interrupt(emu, pc)) {
         hart_sb_flush(emu);     /* v0.18: 进 trap 前提交本 hart 的写 */
+        hart_lb_drain(emu);     /* v0.19: 在途 load 也先写回 */
         h->csr.mcycle++;
         return true;            /* 这一"步"没有执行指令, 但跳进了 handler */
     }
 
     /* 1. Fetch: 取出 16-bit 或 32-bit 指令 (RV32C 允许 2 字节对齐) */
     if ((pc & 1u) != 0) {
+        hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
         if (trap_raise(emu, EXC_INST_MISALIGNED, pc, pc)) {
             h->csr.mcycle++;
             return true;
@@ -303,6 +308,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         int frc = mmu_translate(emu, pc, ACC_FETCH, &fetch_pa);
 
         if (frc != 0) {
+            hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
             if (trap_raise(emu, (u32)frc, pc, pc)) {
                 h->csr.mcycle++;
                 return true;
@@ -317,6 +323,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
          * 否则后面还跟着半个字。
          */
         if (!memory_read16(&emu->mem, fetch_pa, &lo)) {
+            hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
             if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
                 h->csr.mcycle++;
                 return true;
@@ -328,6 +335,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 
         if ((lo & 3u) != 3u) {
             if (!expand_compressed(lo, &raw)) {
+                hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
                 if (trap_raise(emu, EXC_ILLEGAL_INST, lo, pc)) {
                     h->csr.mcycle++;
                     return true;
@@ -356,6 +364,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
             }
 
             if (!fetch_ok) {
+                hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
                 if (trap_raise(emu, EXC_INST_ACCESS, pc, pc)) {
                     h->csr.mcycle++;
                     return true;
@@ -369,6 +378,7 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
 
     /* 2. Decode */
     if (!decode(raw, inst_out)) {
+        hart_lb_drain(emu);  /* v0.19: trap 前写回在途 load */
         if (trap_raise(emu, EXC_ILLEGAL_INST, raw, pc)) {
             h->csr.mcycle++;
             return true;
@@ -388,8 +398,9 @@ bool emu_step(emulator_t *emu, decoded_inst_t *inst_out)
         return false;
     }
 
-    /* 4. 写缓冲老化: 这条指令退休后, 延迟减一 (v0.18) */
+    /* 4. 写缓冲/读缓冲老化: 这条指令退休后, 延迟减一 (v0.18/v0.19) */
     hart_sb_tick(emu);
+    hart_lb_tick(emu);
 
     /* 5. 周期计数 */
     h->csr.mcycle++;

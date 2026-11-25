@@ -191,6 +191,112 @@ void hart_sb_tick(emulator_t *emu)
     }
 }
 
+/* ===================== v0.19 load buffering =====================
+
+   v0.18 只延迟 store, load 是"发射即完成"。真实 CPU 的 load 也可以
+   先进缓冲: 地址算出来、请求发出去, 结果要过几拍才写回寄存器。
+   在这几拍里, 同一个 hart 后面的 store 可以继续执行并提交。
+
+   这就是 load buffering (LB) 的来源:
+
+       P0: r0 = x ;  y = 1
+       P1: r1 = y ;  x = 1
+
+   如果两个 load 都拖到对方 store 提交之后才写回, r0 = r1 = 1。
+   这个结果在顺序一致模型下是非法的 (要读出 1, 两个 load 都必须排在
+   对方 store 之后, 而程序序又要求每个 store 排在自己的 load 之后,
+   成一个环), 在允许 load 缓冲的机器上可以出现。
+
+   这里用最简单的记分牌实现:
+     - 发射时只登记 (rd, pa, size, 扩展方式), 值到提交时才读内存
+     - 后面的指令如果要读这个 rd, 就在 execute 入口停住 (PC 不动),
+       直到写回完成
+     - fence / 原子指令 / trap 边界把读缓冲强制排空
+   ================================================================ */
+
+static void lb_commit_read(emulator_t *emu, lb_entry_t *e)
+{
+    /* 提交时读内存, 但仍然允许从本 hart 的写缓冲转发 */
+    hart_t *h = emu_hart(emu);
+    u64 v = 0;
+
+    if (hart_mem_load(emu, e->addr, &v, e->size)) {
+        if (e->size == 1 && e->sign)      v = sext8((u32)v);
+        else if (e->size == 2 && e->sign) v = sext16((u32)v);
+        reg_write(&h->rf, e->rd, (u32)v);
+    }
+
+    h->lb_pending &= ~(1u << e->rd);
+    e->valid = false;
+}
+
+bool hart_lb_enqueue(emulator_t *emu, u32 rd, u32 pa, u32 size, bool sign)
+{
+    hart_t *h = emu_hart(emu);
+    int slot = -1;
+    int i;
+
+    if (rd == 0 || rd >= 32) {
+        return false;
+    }
+    if (h->lb_pending & (1u << rd)) {
+        return false;               /* 同一个 rd 还有一份没写回 */
+    }
+
+    for (i = 0; i < LB_ENTRIES; i++) {
+        if (!h->lb[i].valid) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        /* 缓冲满: 先写回最早到期的一项, 腾一个位置 */
+        slot = 0;
+        for (i = 1; i < LB_ENTRIES; i++) {
+            if (h->lb[i].delay < h->lb[slot].delay) slot = i;
+        }
+        lb_commit_read(emu, &h->lb[slot]);
+    }
+
+    h->lb[slot].addr  = pa;
+    h->lb[slot].rd    = rd;
+    h->lb[slot].size  = size;
+    h->lb[slot].sign  = sign;
+    h->lb[slot].delay = emu->lb_lag + sb_bank_skew(pa);
+    h->lb[slot].valid = true;
+    h->lb_pending |= (1u << rd);
+    return true;
+}
+
+void hart_lb_tick(emulator_t *emu)
+{
+    hart_t *h = emu_hart(emu);
+    int i;
+
+    if (!emu->weak_mem || emu->lb_lag == 0) return;
+
+    for (i = 0; i < LB_ENTRIES; i++) {
+        if (!h->lb[i].valid) continue;
+        if (h->lb[i].delay > 0) h->lb[i].delay--;
+        if (h->lb[i].delay == 0) lb_commit_read(emu, &h->lb[i]);
+    }
+}
+
+void hart_lb_drain(emulator_t *emu)
+{
+    hart_t *h = emu_hart(emu);
+    int i;
+
+    for (i = 0; i < LB_ENTRIES; i++) {
+        if (h->lb[i].valid) lb_commit_read(emu, &h->lb[i]);
+    }
+}
+
+bool hart_lb_pending(const emulator_t *emu)
+{
+    return emu_hart_c(emu)->lb_pending != 0u;
+}
+
 bool hart_mem_store(emulator_t *emu, u32 pa, u64 value, u32 size)
 {
     hart_t *h = emu_hart(emu);
@@ -255,14 +361,67 @@ bool hart_mem_load(emulator_t *emu, u32 pa, u64 *value, u32 size)
 
 /* =========================== 核心 =========================== */
 
+/*
+ * v0.19: 这条指令实际读/写的整数寄存器集合。
+ *
+ * 不能直接拿 inst->rs1/rs2/rd 三个字段拼 —— S/B/J/U 型里有些不用的
+ * 字段位置放的是立即数, 直接拼会误停。这里按 opcode 只取真正用到的。
+ */
+static u32 inst_reg_mask(const decoded_inst_t *inst)
+{
+    u32 rs1 = 1u << (inst->rs1 & 0x1Fu);
+    u32 rs2 = 1u << (inst->rs2 & 0x1Fu);
+    u32 rd  = 1u << (inst->rd  & 0x1Fu);
+
+    switch (inst->opcode) {
+    case OP_LUI:
+    case OP_AUIPC:
+    case OP_JAL:
+        return rd;
+    case OP_JALR:
+        return rs1 | rd;
+    case OP_BRANCH:
+    case OP_STORE:
+    case OP_STORE_FP:           /* 浮点 store 的地址还是整数寄存器 */
+        return rs1 | rs2;
+    case OP_LOAD:
+    case OP_LOAD_FP:            /* 浮点 load 的地址是整数寄存器 */
+        return rs1 | rd;
+    case OP_ALU:
+        return rs1 | rs2 | rd;
+    case OP_ALUI:
+        return rs1 | rd;
+    case OP_AMO:                /* LR/SC/AMO: rs1 地址, rs2 源, rd 目标 */
+        return rs1 | rs2 | rd;
+    case OP_FENCE:
+        return 0;
+    case OP_SYSTEM:             /* CSR 指令读写整数寄存器, ecall 等字段为 0 */
+        return rs1 | rd;
+    default:
+        return 0;               /* FP/FMA 只碰浮点寄存器 */
+    }
+}
+
 bool execute(emulator_t *emu, decoded_inst_t *inst)
 {
     hart_t *h   = emu_hart(emu);
     u32 pc      = h->rf.pc;
     u32 ilen    = inst->len ? inst->len : 4u;   /* 压缩指令是 2 字节 */
     u32 next_pc = pc + ilen;       /* 默认顺序执行 */
-    u32 rs1_val = reg_read(&h->rf, inst->rs1);
-    u32 rs2_val = reg_read(&h->rf, inst->rs2);
+    u32 rs1_val;
+    u32 rs2_val;
+
+    /*
+     * v0.19 记分牌停等: 有 load 还没写回时, 依赖它的指令原地等。
+     * PC 不动, 下一条指令也不取 —— 等价于流水线 stall。
+     * 写同一个 rd 的指令同样要等, 否则迟到的写回会覆盖新值。
+     */
+    if (h->lb_pending != 0 && (inst_reg_mask(inst) & h->lb_pending) != 0) {
+        return true;
+    }
+
+    rs1_val = reg_read(&h->rf, inst->rs1);
+    rs2_val = reg_read(&h->rf, inst->rs2);
     u32 result  = 0;
     u32 addr = 0;
     u32 pa   = 0;
@@ -448,6 +607,28 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         if (inst->funct3 == F3_LW && pa == CLINT_MTIME_HI) {
             reg_write(&h->rf, inst->rd, (u32)(emu->mtime >> 32));
             break;
+        }
+
+        /*
+         * v0.19: 弱模型 + 打开 load buffering 时, 普通整数 load 进读
+         * 缓冲, 延迟写回。MMIO (地址在 RAM 之外) 和 x0 目标不进缓冲。
+         * 记分牌已经在 execute 入口挡住了同一个 rd 的重复发射。
+         */
+        if (emu->weak_mem && emu->lb_lag > 0 && inst->rd != 0 &&
+            pa + 4u <= emu->mem.size) {
+            bool queued = false;
+
+            switch (inst->funct3) {
+            case F3_LB:  queued = hart_lb_enqueue(emu, inst->rd, pa, 1, true);  break;
+            case F3_LH:  queued = hart_lb_enqueue(emu, inst->rd, pa, 2, true);  break;
+            case F3_LW:  queued = hart_lb_enqueue(emu, inst->rd, pa, 4, false); break;
+            case F3_LBU: queued = hart_lb_enqueue(emu, inst->rd, pa, 1, false); break;
+            case F3_LHU: queued = hart_lb_enqueue(emu, inst->rd, pa, 2, false); break;
+            default:     break;
+            }
+            if (queued) {
+                break;              /* 值在 hart_lb_tick 里写回 */
+            }
         }
 
         switch (inst->funct3) {
@@ -711,6 +892,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
          * 这里是显式的、保守的实现。
          */
         hart_sb_flush_all(emu);
+        hart_lb_drain(emu);         /* v0.19: 原子操作读全局最新值 */
 
         addr = rs1_val;
         if (addr & 3u) {
@@ -845,6 +1027,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
          * trap 边界 = 本 hart 的写全部提交。
          */
         hart_sb_flush(emu);
+        hart_lb_drain(emu);         /* v0.19: trap 边界两侧现场一致 */
         /*
          * ecall / ebreak / mret 的 funct3 都是 0, 不能用 funct3 区分,
          * 必须按整条指令的值判断。早期只有 ecall 时按 funct3 判断没问题,
@@ -963,6 +1146,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
              * 有中断 pending 时 WFI 立即完成, 下一条指令边界就会
              * 进 trap, 所以这种情况下什么都不用做。
              */
+            hart_lb_drain(emu);     /* v0.19: 停之前把在途 load 写回 */
             if (!trap_irq_pending(emu)) {
                 h->waiting = true;
             }
@@ -1091,6 +1275,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
      */
     case OP_FENCE:
         hart_sb_flush(emu);
+        hart_lb_drain(emu);         /* v0.19: fence 之前的 load 要先落定 */
         break;
 
     default:
@@ -1104,6 +1289,7 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
 
 unknown:
     /* 装过 handler 就按非法指令陷入, 否则还是老的"停机报错" */
+    hart_lb_drain(emu);
     if (trap_raise(emu, EXC_ILLEGAL_INST, inst->raw, pc)) {
         return true;
     }
@@ -1116,6 +1302,7 @@ except:
     {
         u32 tval = (fault_cause == EXC_ILLEGAL_INST) ? inst->raw : addr;
 
+        hart_lb_drain(emu);         /* v0.19: 异常现场先让在途 load 落定 */
         if (trap_raise(emu, fault_cause, tval, pc)) {
             return true;        /* handler 接手, pc 已改 */
         }
@@ -1725,6 +1912,79 @@ void membuf_selftest(void)
         hart_mem_load(&emu, x, &v, 4); r1 = (u32)v;
         hart_sb_tick(&emu);
         CHECK(r0 == 0 && r1 == 0, "weak: SB outcome is (0,0)");
+    }
+
+    /* ---------- load buffering (v0.19) ---------- */
+    printf("── load buffering ──\n");
+    {
+        u32 x = 0x004000, y = 0x004008;
+        decoded_inst_t d;
+        u32 r0, r1;
+
+        emu.weak_mem = true;
+        emu.sb_lag = 2;
+        emu.lb_lag = 8;
+        memory_write32(&emu.mem, x, 0);
+        memory_write32(&emu.mem, y, 0);
+        regfile_init(&emu.harts[0].rf);
+        regfile_init(&emu.harts[1].rf);
+
+        /* P0: r5 = x ; y = 1 */
+        emu.cur = 0;
+        CHECK(hart_lb_enqueue(&emu, 5, x, 4, false), "LB: load issued");
+        CHECK(hart_lb_pending(&emu), "LB: scoreboard marks the dest register");
+        CHECK(!hart_lb_enqueue(&emu, 5, y, 4, false),
+              "LB: the same rd cannot be issued twice");
+        hart_mem_store(&emu, y, 1, 4);
+
+        /* P1: r6 = y ; x = 1 */
+        emu.cur = 1;
+        CHECK(hart_lb_enqueue(&emu, 6, y, 4, false), "LB: other hart load issued");
+        hart_mem_store(&emu, x, 1, 4);
+
+        /* 两个 store 先提交, 两个 load 之后才写回 */
+        emu.cur = 0; hart_sb_flush(&emu);
+        emu.cur = 1; hart_sb_flush(&emu);
+        for (i = 0; i < 12; i++) {
+            emu.cur = 0; hart_lb_tick(&emu);
+            emu.cur = 1; hart_lb_tick(&emu);
+        }
+        emu.cur = 0; r0 = reg_read(&emu.harts[0].rf, 5);
+        emu.cur = 1; r1 = reg_read(&emu.harts[1].rf, 6);
+        CHECK(r0 == 1 && r1 == 1,
+              "LB: buffered loads see the later stores (1,1)");
+
+        /* 主动排空: 立即写回 */
+        emu.cur = 0;
+        memory_write32(&emu.mem, y, 0x55);
+        reg_write(&emu.harts[0].rf, 7, 0);
+        CHECK(hart_lb_enqueue(&emu, 7, y, 4, false), "LB: issue for drain");
+        hart_lb_drain(&emu);
+        CHECK(reg_read(&emu.harts[0].rf, 7) == 0x55,
+              "LB: drain writes back immediately");
+        CHECK(!hart_lb_pending(&emu), "LB: scoreboard clear after drain");
+
+        /* 符号扩展在写回时做 */
+        memory_write32(&emu.mem, x, 0x80);
+        CHECK(hart_lb_enqueue(&emu, 8, x, 1, true), "LB: signed byte load");
+        hart_lb_drain(&emu);
+        CHECK(reg_read(&emu.harts[0].rf, 8) == 0xFFFFFF80u,
+              "LB: sign extension on writeback");
+
+        /* 记分牌: 依赖 pending 寄存器的指令原地等 */
+        memory_write32(&emu.mem, x, 1);
+        CHECK(hart_lb_enqueue(&emu, 5, x, 4, false), "LB: issue for stall test");
+        memory_write32(&emu.mem, 0x01000, 0x00128313);  /* addi x6, x5, 1 */
+        CHECK(decode(0x00128313, &d), "LB: decode addi for stall test");
+        emu.harts[0].rf.pc = 0x01000;
+        CHECK(execute(&emu, &d), "LB: stalled execute returns normally");
+        CHECK(emu.harts[0].rf.pc == 0x01000 &&
+              reg_read(&emu.harts[0].rf, 6) == 0,
+              "LB: dependent instruction waits (PC unchanged)");
+        hart_lb_drain(&emu);
+        CHECK(execute(&emu, &d) && emu.harts[0].rf.pc == 0x01004 &&
+              reg_read(&emu.harts[0].rf, 6) == 2,
+              "LB: proceeds after writeback");
     }
 
     emu_free(&emu);

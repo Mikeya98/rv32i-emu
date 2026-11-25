@@ -31,6 +31,7 @@ static void usage(const char *prog)
     printf("  --harts N        emulate N harts (default 1, max %d)\n", MAX_HARTS);
     printf("  --mem-model M    sc | weak (default sc)\n");
     printf("  --sb-lag N       store-buffer visibility lag (default 2)\n");
+    printf("  --lb-lag N       load-buffer writeback lag (default 0 = off)\n");
     printf("  -h, --help       this message\n");
 }
 
@@ -44,6 +45,7 @@ int main(int argc, char *argv[])
     u32 nharts = 1;
     bool weak_mem = false;
     u32 sb_lag = 2;
+    u32 lb_lag = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -75,6 +77,12 @@ int main(int argc, char *argv[])
                 printf("sb-lag must be <= 16\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--lb-lag") == 0 && i + 1 < argc) {
+            lb_lag = (u32)strtoul(argv[++i], NULL, 0);
+            if (lb_lag > 32) {
+                printf("lb-lag must be <= 32\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -88,19 +96,20 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.18                │\n");
+    printf("│  RV32I Emulator v0.19                │\n");
     printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
     printf("│  + CLINT timer / software IRQ (IPI)  │\n");
     printf("│  + PLIC external interrupts (M+S)    │\n");
     printf("│  + Sstc supervisor timer (STIP)      │\n");
     printf("│  + level devices / complete re-raise │\n");
-    printf("│  + store buffer / weak memory model  │\n");
+    printf("│  + store/load buffers, weak memory   │\n");
     printf("└──────────────────────────────────────┘\n\n");
 
     emu_init(&emu, MEM_SIZE);
     emu_init_harts(&emu, nharts);
     emu.weak_mem = weak_mem;    /* v0.18: 必须在 harts 复位之后设置 */
     emu.sb_lag   = sb_lag;
+    emu.lb_lag   = lb_lag;      /* v0.19 */
 
     if (selftest) {
         decode_selftest();
