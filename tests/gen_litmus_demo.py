@@ -24,14 +24,20 @@
 
 用法:
     python tests/gen_litmus_demo.py sb build/sb.elf
+    python tests/gen_litmus_demo.py sb-fence build/sb_fence.elf
     python tests/gen_litmus_demo.py mp build/mp.elf
     python tests/gen_litmus_demo.py mp-nofence build/mp_nofence.elf
+    python tests/gen_litmus_demo.py mp-fence-rr build/mp_rr.elf
+    python tests/gen_litmus_demo.py mp-fence-ww build/mp_ww.elf
     python tests/gen_litmus_demo.py lb build/lb.elf
 
     build/rvemu --harts 2 --mem-model sc   build/sb.elf   → 11
     build/rvemu --harts 2 --mem-model weak build/sb.elf   → 00
+    build/rvemu --harts 2 --mem-model weak build/sb_fence.elf → 11
     build/rvemu --harts 2 --mem-model weak build/mp.elf   → 11
     build/rvemu --harts 2 --mem-model weak build/mp_nofence.elf → 10
+    build/rvemu --harts 2 --mem-model weak build/mp_rr.elf → 10   (v0.20)
+    build/rvemu --harts 2 --mem-model weak build/mp_ww.elf → 11   (v0.20)
     build/rvemu --harts 2 --mem-model sc   build/lb.elf   → 00
     build/rvemu --harts 2 --mem-model weak build/lb.elf   → 00  (lb-lag=0)
     build/rvemu --harts 2 --mem-model weak --lb-lag 16 build/lb.elf → 11
@@ -75,27 +81,31 @@ def print_char(asm, char_reg):
     asm.emit("sb", char_reg, "t6", 0)
 
 
-def build_sb():
+def build_sb(mid_fence=False):
     asm = Assembler()
     asm.label("_start")
     mhartid(asm, "t0")
     asm.emit("bnez", "t0", "p1")
 
-    # ---- P0: x = 1; r0 = y ----
+    # ---- P0: x = 1; [fence]; r0 = y ----
     asm.emit("li", "t1", 1)
     asm.emit("li32", "t2", X)
     asm.emit("sw", "t1", "t2", 0)
+    if mid_fence:
+        asm.emit("fence")
     asm.emit("li32", "t3", Y_SB)
     asm.emit("lw", "t4", "t3", 0)
     asm.emit("addi", "t4", "t4", 48)        # '0' + r0
     print_char(asm, "t4")
     exit0(asm)
 
-    # ---- P1: y = 1; r1 = x ----
+    # ---- P1: y = 1; [fence]; r1 = x ----
     asm.label("p1")
     asm.emit("li", "t1", 1)
     asm.emit("li32", "t2", Y_SB)
     asm.emit("sw", "t1", "t2", 0)
+    if mid_fence:
+        asm.emit("fence")
     asm.emit("li32", "t3", X)
     asm.emit("lw", "t4", "t3", 0)
     asm.emit("addi", "t4", "t4", 48)
@@ -106,7 +116,11 @@ def build_sb():
     return code, labels["_start"]
 
 
-def build_mp(use_fence):
+def build_mp(fence_kind="rw"):
+    """fence_kind: none | rw | rr | ww
+
+    rw → fence rw,rw;  rr → fence r,r;  ww → fence w,w
+    """
     asm = Assembler()
     asm.label("_start")
     mhartid(asm, "t0")
@@ -116,7 +130,8 @@ def build_mp(use_fence):
     asm.emit("li", "t1", 1)
     asm.emit("li32", "t2", X)
     asm.emit("sw", "t1", "t2", 0)
-    asm.emit("fence" if use_fence else "nop")
+    asm.emit({"none": "nop", "rw": "fence",
+              "rr": "fence.rr", "ww": "fence.ww"}[fence_kind])
     asm.emit("li32", "t3", Y)
     asm.emit("sw", "t1", "t3", 0)
     for _ in range(12):
@@ -185,11 +200,17 @@ def main():
 
     kind, out = sys.argv[1], sys.argv[2]
     if kind == "sb":
-        code, entry = build_sb()
+        code, entry = build_sb(False)
+    elif kind == "sb-fence":
+        code, entry = build_sb(True)
     elif kind == "mp":
-        code, entry = build_mp(True)
+        code, entry = build_mp("rw")
     elif kind == "mp-nofence":
-        code, entry = build_mp(False)
+        code, entry = build_mp("none")
+    elif kind == "mp-fence-rr":
+        code, entry = build_mp("rr")
+    elif kind == "mp-fence-ww":
+        code, entry = build_mp("ww")
     elif kind == "lb":
         code, entry = build_lb()
     else:

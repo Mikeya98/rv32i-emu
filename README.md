@@ -36,8 +36,9 @@
 - **电平设备与 complete 重报（v0.17）** — 设备可以按电平方式拉线（`plic_set_level` / 电平寄存器），线一直为高时 claim 先清 pending，`complete` 时网关重新放行、pending 再次置起，中断会重复投递到 handler。驱动必须在 complete 之前把设备的中断清掉，顺序反了就是中断风暴。边沿设备（门铃）没有线电平，complete 后不会重报
 - **写缓冲与弱内存模型（v0.18）** — 每个 hart 一个 8 项写缓冲，`--mem-model weak` 时 store 先入缓冲、`sb_lag + (addr>>2)%16` 条指令后才写进共享内存；本 hart 的 load 从写缓冲转发（store-to-load forwarding），别的 hart 只能看到已提交的写。`fence` 把缓冲刷干净，原子指令/trap 边界也会强制提交。`--mem-model sc` 保持原来的顺序一致。两个 litmus test：store buffering 在 SC 下是 `11`、弱模型下是 `00`；message passing 有 `fence` 是 `11`、去掉 fence 是 `10`
 - **读缓冲与 load buffering（v0.19）** — `--lb-lag N` 打开 load 缓冲：整数 load 发射时只登记 `(rd, 物理地址, 宽度, 符号扩展)`，过 `lb_lag + (addr>>2)%16` 条指令才从内存取值写回；写回前目标寄存器在记分牌上标 pending，后续指令只要读它就原地停住（PC 不动），同一个 rd 不会重复发射。等待期间同 hart 后面的 store 可以照常提交，因此 load 能看到"比自己晚"的 store。`fence`、原子指令、trap 边界和 WFI 都会强制排空读缓冲。配了一个 load buffering litmus：SC 下是 `00`，弱模型默认（`lb_lag=0`）也是 `00`，`--lb-lag 16` 时两个 load 都读到对方后来的 store，输出 `11` —— 这个结果在 SC 下会形成 `Lx<Sy<Ly<Sx<Lx` 的环，是非法的。浮点 load、MMIO 和 x0 目标不进缓冲
+- **fence 谓词（v0.20）** — `fence` 不再无条件全刷：按编码里的 `fm/pred/succ`（每段 `I=8 O=4 R=2 W=1`）决定动作，`pred` 含 `R/I` 排空读缓冲，含 `W/O` 刷新写缓冲，`succ` 不改变动作（fence 点一次等到位，之后的操作天然在后）；`fence.i` 仍全刷。新增两组 litmus 对照：message passing 里 `fence r,r` 只约束 load-load，store 顺序仍然乱，输出 `10`；换成 `fence w,w` 保 store-store，输出 `11`。store buffering 两边各插一条 `fence rw,rw` 后也从 `00` 变成 `11`
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项 + 写缓冲/读缓冲 36 项，共 508 项，`make test` 全过
+- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项 + 写缓冲/读缓冲 41 项，共 513 项，`make test` 全过
 
 ## 快速开始
 

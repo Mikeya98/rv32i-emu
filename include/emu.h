@@ -210,6 +210,21 @@ void  hart_lb_tick(emulator_t *emu);
 void  hart_lb_drain(emulator_t *emu);
 bool  hart_lb_pending(const emulator_t *emu);
 
+/* v0.20: fence 谓词 (fm/pred/succ 位)
+ *
+ * 编码里 pred/succ 各 4 位: I=8, O=4, R=2, W=1。一条 fence 只保证
+ * "pred 类的操作"排在 "succ 类的操作"之前, 不是所有访存都刷。
+ * 这个模型在 fence 点一次性排空, 动作由 pred 决定:
+ *   pred 含 R/I → 排空读缓冲
+ *   pred 含 W/O → 刷新写缓冲
+ */
+#define FENCE_I  0x8u
+#define FENCE_O  0x4u
+#define FENCE_R  0x2u
+#define FENCE_W  0x1u
+
+void  hart_fence(emulator_t *emu, u32 pred, u32 succ);
+
 /* 写缓冲自测 */
 void  membuf_selftest(void);
 

@@ -449,6 +449,19 @@ static const char *rn(u32 idx)
     return (idx < 32) ? reg_name[idx] : "?";
 }
 
+/* v0.20: fence 的 pred/succ 位掩码 → "iorw" 这样的字符串 */
+static void fence_mask_str(u32 m, char *out, u32 n)
+{
+    u32 p = 0;
+
+    if ((m & 0x8u) && p + 1 < n) out[p++] = 'i';
+    if ((m & 0x4u) && p + 1 < n) out[p++] = 'o';
+    if ((m & 0x2u) && p + 1 < n) out[p++] = 'r';
+    if ((m & 0x1u) && p + 1 < n) out[p++] = 'w';
+    if (p == 0 && n > 1)          out[p++] = '-';
+    if (n > 0) out[p] = '\0';
+}
+
 /* R-type ALU 助记符: funct3 + funct7 决定 (含 RV32M) */
 static const char *alu_name(u8 f3, u8 f7)
 {
@@ -627,7 +640,17 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
         break;
 
     case OP_FENCE:
-        snprintf(buf, buf_size, "fence");
+        if (inst->funct3 == 1u) {
+            snprintf(buf, buf_size, "fence.i");
+        } else {
+            char pred[8];
+            char succ[8];
+            u32 enc = inst->imm & 0xFFFu;
+
+            fence_mask_str((enc >> 4) & 0xFu, pred, sizeof(pred));
+            fence_mask_str(enc & 0xFu, succ, sizeof(succ));
+            snprintf(buf, buf_size, "fence %s, %s", pred, succ);
+        }
         break;
 
     case OP_LOAD_FP:

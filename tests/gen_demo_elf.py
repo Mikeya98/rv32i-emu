@@ -217,6 +217,15 @@ class Assembler:
                 out += struct.pack("<I", 0x0FF0000F)
                 addr += 4
 
+            # v0.20: 带谓词的 fence (imm = fm<<8 | pred<<4 | succ)
+            elif mn == "fence.rr":      # fence r, r
+                out += struct.pack("<I", 0x0220000F)
+                addr += 4
+
+            elif mn == "fence.ww":      # fence w, w
+                out += struct.pack("<I", 0x0110000F)
+                addr += 4
+
             elif mn == "mret":
                 out += struct.pack("<I", 0x30200073)
                 addr += 4

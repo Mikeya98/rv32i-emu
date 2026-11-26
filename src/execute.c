@@ -297,6 +297,37 @@ bool hart_lb_pending(const emulator_t *emu)
     return emu_hart_c(emu)->lb_pending != 0u;
 }
 
+/* ===================== v0.20 fence 谓词 =====================
+
+   v0.18/v0.19 的 fence 是"全刷": 写缓冲全部提交、读缓冲全部排空。
+   真实的 fence 带 pred/succ 两个 4 位掩码, 只约束指定类型的访存:
+
+       fence rw, rw    // 全序 (最常用)
+       fence w,  w     // 只要 store-store 顺序
+       fence r,  r     // 只要 load-load 顺序
+       fence rw, w     // load 和 store 都不能越过后面的 store
+
+   这个模型没有独立的流水线, 在 fence 点一次性排空就够; 排空哪一侧
+   由 pred 决定:
+       pred 含 R/I → 之前的 load 先落定 (drain 读缓冲)
+       pred 含 W/O → 之前的 store 先提交 (flush 写缓冲)
+
+   succ 不改变动作 —— 它约束的是 fence 之后新发出的操作, 而我们
+   在 fence 点就把该等的都等完了, 之后的操作天然排在后面。
+   ========================================================== */
+
+void hart_fence(emulator_t *emu, u32 pred, u32 succ)
+{
+    (void)succ;
+
+    if (pred & (FENCE_I | FENCE_R)) {
+        hart_lb_drain(emu);
+    }
+    if (pred & (FENCE_O | FENCE_W)) {
+        hart_sb_flush(emu);
+    }
+}
+
 bool hart_mem_store(emulator_t *emu, u32 pa, u64 value, u32 size)
 {
     hart_t *h = emu_hart(emu);
@@ -1273,10 +1304,25 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
      *
      * SC 模型下写缓冲永远是空的, 这条指令仍然是空操作。
      */
-    case OP_FENCE:
-        hart_sb_flush(emu);
-        hart_lb_drain(emu);         /* v0.19: fence 之前的 load 要先落定 */
+    case OP_FENCE: {
+        /*
+         * v0.20: 按 fm/pred/succ 决定刷哪一侧。
+         *
+         *   bits [11:8] fm, [7:4] pred, [3:0] succ, 每段 I=8 O=4 R=2 W=1
+         *
+         * fence.i (funct3=1) 是指令流刷新, 这个模拟器没有指令缓存,
+         * 保持原来"全刷"的行为。
+         */
+        u32 enc = inst->imm & 0xFFFu;
+
+        if (inst->funct3 == 1u) {
+            hart_sb_flush(emu);
+            hart_lb_drain(emu);
+        } else {
+            hart_fence(emu, (enc >> 4) & 0xFu, enc & 0xFu);
+        }
         break;
+    }
 
     default:
         goto unknown;
@@ -1840,6 +1886,20 @@ void membuf_selftest(void)
     CHECK(hart_mem_load(&emu, B, &v, 4) && v == 0xDEADBEEF,
           "weak: fence publishes the store");
 
+    /* ---------- v0.20: fence 的 pred/succ ---------- */
+    printf("── fence pred/succ ──\n");
+    emu.cur = 0;
+    hart_mem_store(&emu, B, 0x11111111, 4);
+    hart_fence(&emu, FENCE_R, FENCE_R);     /* 只排空读缓冲 */
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, B, &v, 4) && v == 0xDEADBEEF,
+          "fence r,r: store stays buffered");
+    emu.cur = 0;
+    hart_fence(&emu, FENCE_W, FENCE_W);     /* 只要 store-store 顺序 */
+    emu.cur = 1;
+    CHECK(hart_mem_load(&emu, B, &v, 4) && v == 0x11111111,
+          "fence w,w: publishes the store");
+
     /* ---------- 宽度 ---------- */
     printf("── sizes ──\n");
     emu.cur = 0;
@@ -1970,6 +2030,17 @@ void membuf_selftest(void)
         hart_lb_drain(&emu);
         CHECK(reg_read(&emu.harts[0].rf, 8) == 0xFFFFFF80u,
               "LB: sign extension on writeback");
+
+        /* v0.20: fence 谓词管不管读缓冲 */
+        reg_write(&emu.harts[0].rf, 9, 0);
+        CHECK(hart_lb_enqueue(&emu, 9, y, 4, false),
+              "LB: enqueue before fence w,w");
+        hart_fence(&emu, FENCE_W, FENCE_W);
+        CHECK(hart_lb_pending(&emu),
+              "fence w,w leaves the load buffer alone");
+        hart_fence(&emu, FENCE_R, FENCE_R);
+        CHECK(!hart_lb_pending(&emu),
+              "fence r,r drains the load buffer");
 
         /* 记分牌: 依赖 pending 寄存器的指令原地等 */
         memory_write32(&emu.mem, x, 1);
