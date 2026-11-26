@@ -96,8 +96,10 @@ int main(int argc, char *argv[])
     }
 
     printf("┌──────────────────────────────────────┐\n");
-    printf("│  RV32I Emulator v0.20                │\n");
-    printf("│  RV32IMAFC + D + Sv32 + S/U + SMP    │\n");
+    printf("│  RV32I Emulator v0.21                │\n");
+    printf("│  RV32IMAFC + D + Zbb + Sv32 + S/U    │\n");
+    printf("│  (Zbb subset: andn/orn/xnor/min/max, │\n");
+    printf("│   clz/ctz/cpop/rol/ror/sext/rev8)    │\n");
     printf("│  + CLINT timer / software IRQ (IPI)  │\n");
     printf("│  + PLIC external interrupts (M+S)    │\n");
     printf("│  + Sstc supervisor timer (STIP)      │\n");

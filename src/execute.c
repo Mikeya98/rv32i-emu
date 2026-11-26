@@ -433,6 +433,46 @@ static u32 inst_reg_mask(const decoded_inst_t *inst)
     }
 }
 
+/* ===================== v0.21 Zbb 基本位操作 ===================== */
+
+static u32 zbb_clz(u32 x)
+{
+    return x ? (u32)__builtin_clz(x) : 32u;
+}
+
+static u32 zbb_ctz(u32 x)
+{
+    return x ? (u32)__builtin_ctz(x) : 32u;
+}
+
+static u32 zbb_cpop(u32 x)
+{
+    return (u32)__builtin_popcount(x);
+}
+
+/* orc.b: 每个字节非零就置成 0xFF */
+static u32 zbb_orc_b(u32 x)
+{
+    u32 r = 0;
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (((x >> (i * 8)) & 0xFFu) != 0) {
+            r |= 0xFFu << (i * 8);
+        }
+    }
+    return r;
+}
+
+/* rev8: 字节序反转 */
+static u32 zbb_rev8(u32 x)
+{
+    return ((x & 0x000000FFu) << 24) |
+           ((x & 0x0000FF00u) << 8)  |
+           ((x & 0x00FF0000u) >> 8)  |
+           ((x & 0xFF000000u) >> 24);
+}
+
 bool execute(emulator_t *emu, decoded_inst_t *inst)
 {
     hart_t *h   = emu_hart(emu);
@@ -500,6 +540,47 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             break;
         }
 
+        /* v0.21 Zbb: funct7 是主分类, 先处理不与 RV32I 重叠的几组 */
+        if (inst->funct7 == 0x05u) {
+            switch (inst->funct3) {
+            case 4:  /* MIN */
+                result = ((s32)rs1_val < (s32)rs2_val) ? rs1_val : rs2_val;
+                break;
+            case 5:  /* MINU */
+                result = (rs1_val < rs2_val) ? rs1_val : rs2_val;
+                break;
+            case 6:  /* MAX */
+                result = ((s32)rs1_val > (s32)rs2_val) ? rs1_val : rs2_val;
+                break;
+            case 7:  /* MAXU */
+                result = (rs1_val > rs2_val) ? rs1_val : rs2_val;
+                break;
+            default:
+                goto unknown;
+            }
+            reg_write(&h->rf, inst->rd, result);
+            break;
+        }
+
+        if (inst->funct7 == 0x30u &&
+            (inst->funct3 == 1u || inst->funct3 == 5u)) {
+            u32 sh = rs2_val & 0x1Fu;
+
+            if (inst->funct3 == 1u) {
+                result = (rs1_val << sh) | (rs1_val >> ((32u - sh) & 0x1Fu));
+            } else {
+                result = (rs1_val >> sh) | (rs1_val << ((32u - sh) & 0x1Fu));
+            }
+            reg_write(&h->rf, inst->rd, result);
+            break;
+        }
+
+        if (inst->funct7 == 0x04u && inst->funct3 == 4u) {
+            result = rs1_val & 0xFFFFu;         /* ZEXT.H */
+            reg_write(&h->rf, inst->rd, result);
+            break;
+        }
+
         switch (inst->funct3) {
         case F3_ADDSUB: /* ADD 或 SUB */
             result = (inst->funct7 == 0x20)
@@ -516,7 +597,9 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
             result = (rs1_val < rs2_val) ? 1 : 0;
             break;
         case F3_XOR:
-            result = rs1_val ^ rs2_val;
+            result = (inst->funct7 == 0x20)
+                     ? ~(rs1_val ^ rs2_val)            /* XNOR */
+                     : (rs1_val ^ rs2_val);
             break;
         case F3_SRLSRA: /* SRL 或 SRA */
             result = (inst->funct7 == 0x20)
@@ -524,10 +607,14 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
                      : rs1_val >> (rs2_val & 0x1F);             /* SRL */
             break;
         case F3_OR:
-            result = rs1_val | rs2_val;
+            result = (inst->funct7 == 0x20)
+                     ? (rs1_val | ~rs2_val)            /* ORN */
+                     : (rs1_val | rs2_val);
             break;
         case F3_AND:
-            result = rs1_val & rs2_val;
+            result = (inst->funct7 == 0x20)
+                     ? (rs1_val & ~rs2_val)            /* ANDN */
+                     : (rs1_val & rs2_val);
             break;
         default:
             goto unknown;
@@ -541,8 +628,21 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         case F3_ADDSUB: /* ADDI */
             result = rs1_val + inst->imm;
             break;
-        case F3_SLL:    /* SLLI */
-            result = rs1_val << (inst->imm & 0x1F);
+        case F3_SLL:    /* SLLI, 或 v0.21 的 clz/ctz/cpop/sext.* */
+            if (inst->funct7 == 0x30u) {
+                switch (inst->rs2) {
+                case 0: result = zbb_clz(rs1_val); break;
+                case 1: result = zbb_ctz(rs1_val); break;
+                case 2: result = zbb_cpop(rs1_val); break;
+                case 4: result = sext8(rs1_val & 0xFFu);    /* SEXT.B */
+                    break;
+                case 5: result = sext16(rs1_val & 0xFFFFu); /* SEXT.H */
+                    break;
+                default: goto unknown;
+                }
+            } else {
+                result = rs1_val << (inst->imm & 0x1F);
+            }
             break;
         case F3_SLT:    /* SLTI */
             result = ((s32)rs1_val < (s32)inst->imm) ? 1 : 0;
@@ -553,10 +653,16 @@ bool execute(emulator_t *emu, decoded_inst_t *inst)
         case F3_XOR:    /* XORI */
             result = rs1_val ^ inst->imm;
             break;
-        case F3_SRLSRA: /* SRLI 或 SRAI */
-            result = (inst->funct7 == 0x20)
-                     ? (u32)((s32)rs1_val >> (inst->imm & 0x1F))  /* SRAI */
-                     : rs1_val >> (inst->imm & 0x1F);             /* SRLI */
+        case F3_SRLSRA: /* SRLI/SRAI, 或 v0.21 的 orc.b / rev8 */
+            if (inst->funct7 == 0x14u && inst->rs2 == 7u) {
+                result = zbb_orc_b(rs1_val);
+            } else if (inst->funct7 == 0x35u && inst->rs2 == 0u) {
+                result = zbb_rev8(rs1_val);
+            } else {
+                result = (inst->funct7 == 0x20)
+                         ? (u32)((s32)rs1_val >> (inst->imm & 0x1F))  /* SRAI */
+                         : rs1_val >> (inst->imm & 0x1F);             /* SRLI */
+            }
             break;
         case F3_OR:     /* ORI */
             result = rs1_val | inst->imm;
@@ -1795,6 +1901,53 @@ void execute_selftest(void)
               "sstatus exposes FS bits");
         emu_free(&emu);
     }
+
+    /* ==================== v0.21 Zbb ==================== */
+    printf("── Zbb bit manipulation ──\n");
+    emu_init(&emu, MEM_SIZE);
+    h->state = EMU_RUNNING;
+
+    reg_write(&h->rf, 1, 0x00FF00FFu);
+    reg_write(&h->rf, 2, 0x0F0F0F0Fu);
+    reg_write(&h->rf, 3, 0x00000081u);
+    reg_write(&h->rf, 4, 4u);
+
+    mem_write_inst(&emu.mem, base,      0x4020F2B3);  /* andn  x5, x1, x2 */
+    mem_write_inst(&emu.mem, base + 4,  0x4020E333);  /* orn   x6, x1, x2 */
+    mem_write_inst(&emu.mem, base + 8,  0x4020C3B3);  /* xnor  x7, x1, x2 */
+    mem_write_inst(&emu.mem, base + 12, 0x0A20C433);  /* min   x8, x1, x2 */
+    mem_write_inst(&emu.mem, base + 16, 0x0A20F4B3);  /* maxu  x9, x1, x2 */
+    mem_write_inst(&emu.mem, base + 20, 0x604195B3);  /* rol   x11, x3, x4 */
+    mem_write_inst(&emu.mem, base + 24, 0x6041D633);  /* ror   x12, x3, x4 */
+    mem_write_inst(&emu.mem, base + 28, 0x60019693);  /* clz   x13, x3 */
+    mem_write_inst(&emu.mem, base + 32, 0x60119713);  /* ctz   x14, x3 */
+    mem_write_inst(&emu.mem, base + 36, 0x60219793);  /* cpop  x15, x3 */
+    mem_write_inst(&emu.mem, base + 40, 0x60419813);  /* sext.b x16, x3 */
+    mem_write_inst(&emu.mem, base + 44, 0x60519893);  /* sext.h x17, x3 */
+    mem_write_inst(&emu.mem, base + 48, 0x2871D913);  /* orc.b x18, x3 */
+    mem_write_inst(&emu.mem, base + 52, 0x6A01D993);  /* rev8  x19, x3 */
+    mem_write_inst(&emu.mem, base + 56, 0x0800CA33);  /* zext.h x20, x1 */
+    mem_write_inst(&emu.mem, base + 60, 0x00000073);  /* ecall */
+
+    h->rf.pc = base;
+    emu_run(&emu, 16);
+
+    val = reg_read(&h->rf, 5);  CHECK(val == 0x00F000F0u, "andn");
+    val = reg_read(&h->rf, 6);  CHECK(val == 0xF0FFF0FFu, "orn");
+    val = reg_read(&h->rf, 7);  CHECK(val == 0xF00FF00Fu, "xnor");
+    val = reg_read(&h->rf, 8);  CHECK(val == 0x00FF00FFu, "min");
+    val = reg_read(&h->rf, 9);  CHECK(val == 0x0F0F0F0Fu, "maxu");
+    val = reg_read(&h->rf, 11); CHECK(val == 0x00000810u, "rol");
+    val = reg_read(&h->rf, 12); CHECK(val == 0x10000008u, "ror");
+    val = reg_read(&h->rf, 13); CHECK(val == 24u,         "clz");
+    val = reg_read(&h->rf, 14); CHECK(val == 0u,          "ctz");
+    val = reg_read(&h->rf, 15); CHECK(val == 2u,          "cpop");
+    val = reg_read(&h->rf, 16); CHECK(val == 0xFFFFFF81u, "sext.b");
+    val = reg_read(&h->rf, 17); CHECK(val == 0x00000081u, "sext.h");
+    val = reg_read(&h->rf, 18); CHECK(val == 0x000000FFu, "orc.b");
+    val = reg_read(&h->rf, 19); CHECK(val == 0x81000000u, "rev8");
+    val = reg_read(&h->rf, 20); CHECK(val == 0x000000FFu, "zext.h");
+    emu_free(&emu);
 
     /* ==================== 结果汇总 ==================== */
     printf("\n╔══════════════════════════════════════════════════════════╗\n");

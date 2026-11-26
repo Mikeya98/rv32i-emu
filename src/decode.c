@@ -475,19 +475,42 @@ static const char *alu_name(u8 f3, u8 f7)
         "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"
     };
 
+    static const char *const mm[8] = {
+        NULL, NULL, NULL, NULL, "min", "minu", "max", "maxu"
+    };
+    static const char *const zz[8] = {
+        NULL, "rol", NULL, NULL, NULL, "ror", NULL, NULL
+    };
+
     if (f3 >= 8) return NULL;
     if (f7 == 0x01) return m[f3];
-    if (f7 == 0x20) return alt[f3];
+    if (f7 == 0x05) return mm[f3];       /* v0.21: min/max 组 */
+    if (f7 == 0x30) return zz[f3];       /* v0.21: rol/ror */
+    if (f7 == 0x04 && f3 == 4) return "zext.h";
+    if (f7 == 0x20) {
+        if (f3 == 7) return "andn";
+        if (f3 == 6) return "orn";
+        if (f3 == 4) return "xnor";
+        return alt[f3];                  /* sub / sra */
+    }
     if (f7 == 0x00) return base[f3];
     return NULL;
 }
 
-static const char *alui_name(u8 f3, u8 f7)
+static const char *alui_name(u8 f3, u8 f7, u8 rs2)
 {
     static const char *const n[8] = {
         "addi", "slli", "slti", "sltiu", "xori", "srli", "ori", "andi"
     };
+    static const char *const z[8] = {
+        "clz", "ctz", "cpop", NULL, "sext.b", "sext.h", NULL, NULL
+    };
+
     if (f3 >= 8) return NULL;
+    /* v0.21: Zbb 的单操作数指令, rs2 字段当次操作码用 */
+    if (f3 == 1 && f7 == 0x30) return (rs2 < 8) ? z[rs2] : NULL;
+    if (f3 == 5 && f7 == 0x14 && rs2 == 7) return "orc.b";
+    if (f3 == 5 && f7 == 0x35 && rs2 == 0) return "rev8";
     if (f3 == 5 && f7 == 0x20) return "srai";
     if (f3 == 1 && f7 != 0x00) return NULL;   /* 当前不区分 RV32I 的 shamt 高位 */
     if (f3 == 5 && f7 != 0x00 && f7 != 0x20) return NULL;
@@ -552,15 +575,27 @@ void decode_disasm(decoded_inst_t *inst, char *buf, u32 buf_size)
     case OP_ALU:
         mn = alu_name(inst->funct3, inst->funct7);
         if (mn) {
-            snprintf(buf, buf_size, "%s %s, %s, %s",
-                     mn, rn(inst->rd), rn(inst->rs1), rn(inst->rs2));
+            /* v0.21: zext.h 只有一个源操作数 */
+            if (inst->funct7 == 0x04u && inst->funct3 == 4u) {
+                snprintf(buf, buf_size, "%s %s, %s",
+                         mn, rn(inst->rd), rn(inst->rs1));
+            } else {
+                snprintf(buf, buf_size, "%s %s, %s, %s",
+                         mn, rn(inst->rd), rn(inst->rs1), rn(inst->rs2));
+            }
         }
         break;
 
     case OP_ALUI:
-        mn = alui_name(inst->funct3, inst->funct7);
+        mn = alui_name(inst->funct3, inst->funct7, inst->rs2);
         if (mn) {
-            if (inst->funct3 == 1 || inst->funct3 == 5) {
+            /* v0.21: Zbb 单操作数指令打印成 mn rd, rs1 */
+            if ((inst->funct3 == 1 && inst->funct7 == 0x30) ||
+                (inst->funct3 == 5 && inst->funct7 == 0x14) ||
+                (inst->funct3 == 5 && inst->funct7 == 0x35)) {
+                snprintf(buf, buf_size, "%s %s, %s",
+                         mn, rn(inst->rd), rn(inst->rs1));
+            } else if (inst->funct3 == 1 || inst->funct3 == 5) {
                 /* 移位: 第三操作数是 shamt */
                 snprintf(buf, buf_size, "%s %s, %s, %u",
                          mn, rn(inst->rd), rn(inst->rs1), inst->imm & 0x1F);

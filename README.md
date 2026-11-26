@@ -18,6 +18,7 @@
 - **RV32F 单精度浮点** — fadd/fsub/fmul/fdiv/fsqrt、fsgnj/fsgnjn/fsgnjx、fmin/fmax、feq/flt/fle、fcvt.w.s/fcvt.wu.s/fcvt.s.w/fcvt.s.wu、fmv.x.w/fmv.w.x/fclass、flw/fsw；fflags/frm/fcsr 三个 CSR，舍入和异常标志走宿主 fenv
 - **mstatus.FS 浮点状态** — FS[14:13] 的 Off/Initial/Clean/Dirty 四态：Off 时任何 FP 指令（含 flw/fsw/fld/fsd）和 fflags/frm/fcsr 访问都按非法指令陷入；FS 非零时执行 FP 指令或写浮点 CSR 自动置 Dirty；sstatus 里能看到同一组位，S 态软件也能开关浮点
 - **RV32C 压缩指令** — 16 位指令先展开成等价的 32 位指令，再复用 RV32I 的执行路径；覆盖 c.addi/c.li/c.lui/c.addi4spn/c.addi16sp、c.lw/c.sw/c.lwsp/c.swsp、c.slli/c.srli/c.srai/c.andi/c.sub/c.xor/c.or/c.and、c.beqz/c.bnez/c.j/c.jal/c.jr/c.jalr/c.mv/c.add/c.ebreak；取指按 2 字节对齐，`jal/jalr` 的链接值也是 pc+2
+- **Zbb 基本位操作（v0.21）** — `funct7=0x05` 的 min/minu/max/maxu、`funct7=0x20` 的 andn/orn/xnor（和 sub/sra 共用 funct7，按 funct3 区分）、`funct7=0x30` 的 rol/ror，以及 OP-IMM 里借 rs2 字段当次操作码的 clz/ctz/cpop/sext.b/sext.h、`0x14` 的 orc.b、`0x35` 的 rev8 和 OP 里的 zext.h。反汇编把单操作数指令打印成 `clz a3, gp` 这种形式。`clz/ctz` 对 0 返回 32（C 的 `__builtin_clz` 未定义，模拟器里显式处理）
 - **ELF 加载器** — 手写 32-bit RISC-V ELF 解析，不依赖 libelf
 - **1MB 扁平内存** — 字节寻址，load/store 带边界检查；`0x20000000` 写字节即输出到终端
 - **系统调用** — `ecall` 按 a7 分发（exit / write），接近 RISC-V Linux ABI
@@ -38,7 +39,7 @@
 - **读缓冲与 load buffering（v0.19）** — `--lb-lag N` 打开 load 缓冲：整数 load 发射时只登记 `(rd, 物理地址, 宽度, 符号扩展)`，过 `lb_lag + (addr>>2)%16` 条指令才从内存取值写回；写回前目标寄存器在记分牌上标 pending，后续指令只要读它就原地停住（PC 不动），同一个 rd 不会重复发射。等待期间同 hart 后面的 store 可以照常提交，因此 load 能看到"比自己晚"的 store。`fence`、原子指令、trap 边界和 WFI 都会强制排空读缓冲。配了一个 load buffering litmus：SC 下是 `00`，弱模型默认（`lb_lag=0`）也是 `00`，`--lb-lag 16` 时两个 load 都读到对方后来的 store，输出 `11` —— 这个结果在 SC 下会形成 `Lx<Sy<Ly<Sx<Lx` 的环，是非法的。浮点 load、MMIO 和 x0 目标不进缓冲
 - **fence 谓词（v0.20）** — `fence` 不再无条件全刷：按编码里的 `fm/pred/succ`（每段 `I=8 O=4 R=2 W=1`）决定动作，`pred` 含 `R/I` 排空读缓冲，含 `W/O` 刷新写缓冲，`succ` 不改变动作（fence 点一次等到位，之后的操作天然在后）；`fence.i` 仍全刷。新增两组 litmus 对照：message passing 里 `fence r,r` 只约束 load-load，store 顺序仍然乱，输出 `10`；换成 `fence w,w` 保 store-store，输出 `11`。store buffering 两边各插一条 `fence rw,rw` 后也从 `00` 变成 `11`
 - **简化 CLINT** — `mtime` 全机器共享，`mtimecmp` 每个 hart 一个（8 字节步长，地址与真实 CLINT 一致），可做定时器中断
-- **自测** — 解码 49 项 + RV32C 展开/执行 33 项 + 执行 65 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项 + 写缓冲/读缓冲 41 项，共 513 项，`make test` 全过
+- **自测** — 解码 64 项 + RV32C 展开/执行 33 项 + 执行 80 项 + 多 hart/IPI 34 项 + PLIC 119 项 + trap 20 项 + S 态/委托 30 项 + S 定时器 31 项 + Sv32 33 项 + RV32F/D/FMA 67 项 + 写缓冲/读缓冲 41 项，共 543 项，`make test` 全过
 
 ## 快速开始
 

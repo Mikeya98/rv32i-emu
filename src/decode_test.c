@@ -308,6 +308,24 @@ void decode_selftest(void)
                ok ? "true" : "false", inst.fmt);
     }
 
+    /* ==================== Zbb 位操作 (v0.21) ==================== */
+    printf("── Zbb bit manipulation ──\n");
+    TEST_FULL("andn x5, x1, x2",  0x4020F2B3, FMT_R, OP_ALU,  0);
+    TEST_FULL("orn  x6, x1, x2",  0x4020E333, FMT_R, OP_ALU,  0);
+    TEST_FULL("xnor x7, x1, x2",  0x4020C3B3, FMT_R, OP_ALU,  0);
+    TEST_FULL("min  x8, x1, x2",  0x0A20C433, FMT_R, OP_ALU,  0);
+    TEST_FULL("maxu x9, x1, x2",  0x0A20F4B3, FMT_R, OP_ALU,  0);
+    TEST_FULL("rol  x11, x3, x4", 0x604195B3, FMT_R, OP_ALU,  0);
+    TEST_FULL("ror  x12, x3, x4", 0x6041D633, FMT_R, OP_ALU,  0);
+    TEST_FULL("clz  x13, x3",     0x60019693, FMT_I, OP_ALUI, 0x600);
+    TEST_FULL("ctz  x14, x3",     0x60119713, FMT_I, OP_ALUI, 0x601);
+    TEST_FULL("cpop x15, x3",     0x60219793, FMT_I, OP_ALUI, 0x602);
+    TEST_FULL("sext.b x16, x3",   0x60419813, FMT_I, OP_ALUI, 0x604);
+    TEST_FULL("sext.h x17, x3",   0x60519893, FMT_I, OP_ALUI, 0x605);
+    TEST_FULL("orc.b x18, x3",    0x2871D913, FMT_I, OP_ALUI, 0x287);
+    TEST_FULL("rev8 x19, x3",     0x6A01D993, FMT_I, OP_ALUI, 0x6A0);
+    TEST_FULL("zext.h x20, x1",   0x0800CA33, FMT_R, OP_ALU,  0);
+
     /* ==================== 结果汇总 ==================== */
     printf("\n");
     printf("╔══════════════════════════════════════════════════════════╗\n");
